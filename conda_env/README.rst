@@ -10,7 +10,7 @@ Provides the `conda env` interface to Conda environments.
 Installing
 ----------
 
-To install `conda env` with conda, run the following command in your root environment:
+To install `conda env` with conda, run the following command in your base environment:
 
 .. code-block:: bash
 
@@ -98,7 +98,7 @@ Environment file example
       - numpy=1.9.*
       - nodejs=0.10.*
       - flask
-      pip:
+      - pip:
         - Flask-Testing
 
 **Recommendation:** Always create your `environment.yml` file by hand.

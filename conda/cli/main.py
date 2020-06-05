@@ -1,5 +1,6 @@
-# conda is distributed under the terms of the BSD 3-clause license.
-# Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
+# -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 """conda is a tool for managing environments and packages.
 
 conda provides the following commands:
@@ -63,47 +64,71 @@ def init_loggers(context=None):
         set_verbosity(context.verbosity)
 
 
-def _main(*args):
-    from .conda_argparse import do_call
-    from ..base.constants import SEARCH_PATH
-    from ..base.context import context
-
+def _main(*args, **kwargs):
     if len(args) == 1:
         args = args + ('-h',)
 
     p = generate_parser()
     args = p.parse_args(args[1:])
 
-    context.__init__(SEARCH_PATH, 'conda', args)
+    from ..base.context import context
+    context.__init__(argparse_args=args)
     init_loggers(context)
 
+    # used with main_pip.py
+    post_parse_hook = kwargs.pop('post_parse_hook', None)
+    if post_parse_hook:
+        post_parse_hook(args, p)
+
+    from .conda_argparse import do_call
     exit_code = do_call(args, p)
     if isinstance(exit_code, int):
         return exit_code
 
 
-def _ensure_text_type(value):
-    # copying here from conda/common/compat.py to avoid the import
-    try:
-        return value.decode('utf-8')
-    except AttributeError:
-        # AttributeError: '<>' object has no attribute 'decode'
-        # In this case assume already text_type and do nothing
-        return value
-    except UnicodeDecodeError:
-        try:
-            from requests.packages.chardet import detect
-        except ImportError:  # pragma: no cover
-            from pip._vendor.requests.packages.chardet import detect
-        encoding = detect(value).get('encoding') or 'utf-8'
-        return value.decode(encoding)
+if sys.platform == 'win32' and sys.version_info[0] == 2:
+    def win32_unicode_argv():
+        """Uses shell32.GetCommandLineArgvW to get sys.argv as a list of Unicode
+        strings.
+
+        Versions 2.x of Python don't support Unicode in sys.argv on
+        Windows, with the underlying Windows API instead replacing multi-byte
+        characters with '?'.
+        """
+
+        from ctypes import POINTER, byref, cdll, c_int, windll
+        from ctypes.wintypes import LPCWSTR, LPWSTR
+
+        GetCommandLineW = cdll.kernel32.GetCommandLineW
+        GetCommandLineW.argtypes = []
+        GetCommandLineW.restype = LPCWSTR
+
+        CommandLineToArgvW = windll.shell32.CommandLineToArgvW
+        CommandLineToArgvW.argtypes = [LPCWSTR, POINTER(c_int)]
+        CommandLineToArgvW.restype = POINTER(LPWSTR)
+
+        cmd = GetCommandLineW()
+        argc = c_int(0)
+        argv = CommandLineToArgvW(cmd, byref(argc))
+        if argc.value > 0:
+            # Remove Python executable and commands if present
+            start = argc.value - len(sys.argv)
+            return [argv[i] for i in range(start, argc.value)]
 
 
-def main(*args):
+def main(*args, **kwargs):
+    # conda.common.compat contains only stdlib imports
+    from ..common.compat import ensure_text_type, init_std_stream_encoding
+
+    init_std_stream_encoding()
+
     if not args:
-        args = sys.argv
+        if sys.platform == 'win32' and sys.version_info[0] == 2:
+            args = sys.argv = win32_unicode_argv()
+        else:
+            args = sys.argv
 
-    args = tuple(_ensure_text_type(s) for s in args)
+    args = tuple(ensure_text_type(s) for s in args)
 
     if len(args) > 1:
         try:
@@ -115,16 +140,14 @@ def main(*args):
                 import conda.cli.activate as activate
                 activate.main()
                 return
-            elif argv1 in ('activate', 'deactivate'):
-                from ..exceptions import CommandNotFoundError
-                raise CommandNotFoundError(argv1)
-        except Exception as e:
-            from ..exceptions import handle_exception
+        except Exception:
+            _, exc_val, exc_tb = sys.exc_info()
             init_loggers()
-            return handle_exception(e)
+            from ..exceptions import ExceptionHandler
+            return ExceptionHandler().handle_exception(exc_val, exc_tb)
 
     from ..exceptions import conda_exception_handler
-    return conda_exception_handler(_main, *args)
+    return conda_exception_handler(_main, *args, **kwargs)
 
 
 if __name__ == '__main__':

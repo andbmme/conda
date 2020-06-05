@@ -64,25 +64,20 @@ setup(
 
 
 """
-from __future__ import print_function, division, absolute_import
+from __future__ import absolute_import, division, print_function
 
-import sys
 from collections import namedtuple
-from logging import getLogger
-from os import getenv, remove, listdir
-from os.path import abspath, dirname, expanduser, isdir, isfile, join
-from re import compile
-from shlex import split
-from subprocess import CalledProcessError, Popen, PIPE
-from fnmatch import fnmatchcase
 from distutils.command.build_py import build_py
 from distutils.command.sdist import sdist
 from distutils.util import convert_path
-
-try:
-    from setuptools.command.test import test as TestCommand
-except ImportError:
-    TestCommand = object
+from fnmatch import fnmatchcase
+from logging import getLogger
+from os import getenv, listdir, remove
+from os.path import abspath, dirname, expanduser, isdir, isfile, join
+from re import compile
+from conda._vendor.auxlib.compat import shlex_split_unicode
+from subprocess import CalledProcessError, PIPE, Popen
+import sys
 
 log = getLogger(__name__)
 
@@ -94,7 +89,7 @@ GIT_DESCRIBE_REGEX = compile(r"(?:[_-a-zA-Z]*)"
 
 def call(command, path=None, raise_on_error=True):
     path = sys.prefix if path is None else abspath(path)
-    p = Popen(split(command), cwd=path, stdout=PIPE, stderr=PIPE)
+    p = Popen(shlex_split_unicode(command), cwd=path, stdout=PIPE, stderr=PIPE)
     stdout, stderr = p.communicate()
     rc = p.returncode
     log.debug("{0} $  {1}\n"
@@ -136,15 +131,20 @@ def _git_describe_tags(path):
         raise CalledProcessError(response.rc, response.stderr)
 
 
-def _get_version_from_git_tag(path):
+def _get_version_from_git_tag(tag):
     """Return a PEP440-compliant version derived from the git status.
     If that fails for any reason, return the changeset hash.
     """
-    m = GIT_DESCRIBE_REGEX.match(_git_describe_tags(path) or '')
+    m = GIT_DESCRIBE_REGEX.match(tag)
     if m is None:
         return None
     version, post_commit, hash = m.groups()
     return version if post_commit == '0' else "{0}.post{1}+{2}".format(version, post_commit, hash)
+
+
+def _get_version_from_git_clone(path):
+    tag = _git_describe_tags(path) or ''
+    return _get_version_from_git_tag(tag)
 
 
 def get_version(dunder_file):
@@ -162,7 +162,7 @@ def get_version(dunder_file):
     """
     path = abspath(expanduser(dirname(dunder_file)))
     try:
-        return _get_version_from_version_file(path) or _get_version_from_git_tag(path)
+        return _get_version_from_version_file(path) or _get_version_from_git_clone(path)
     except CalledProcessError as e:
         log.warn(repr(e))
         return None
@@ -211,32 +211,6 @@ class SDistCommand(sdist):
         target_dir = join(base_dir, self.distribution.metadata.name)
         write_version_into_init(target_dir, self.distribution.metadata.version)
         write_version_file(target_dir, self.distribution.metadata.version)
-
-
-class Tox(TestCommand):
-    # TODO: Make this class inherit from distutils instead of setuptools
-    user_options = [('tox-args=', 'a', "Arguments to pass to tox")]
-
-    def initialize_options(self):
-        TestCommand.initialize_options(self)
-        self.tox_args = None
-
-    def finalize_options(self):
-        TestCommand.finalize_options(self)
-        self.test_args = []
-        self.test_suite = True
-
-    def run_tests(self):
-        # import here, because outside the eggs aren't loaded
-        from tox import cmdline
-        from shlex import split
-        args = self.tox_args
-        if args:
-            args = split(self.tox_args)
-        else:
-            args = ''
-        errno = cmdline(args=args)
-        sys.exit(errno)
 
 
 # swiped from setuptools

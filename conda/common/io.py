@@ -1,69 +1,137 @@
 # -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, Executor, Future, _base, as_completed  # NOQA
+from concurrent.futures.thread import _WorkItem
 from contextlib import contextmanager
+from enum import Enum
+from errno import EPIPE, ESHUTDOWN
+from functools import partial, wraps
+import sys
+if sys.version_info[0] > 2:
+    # Not used at present.
+    from io import BytesIO
 from itertools import cycle
-import logging
+import json
+import logging  # lgtm [py/import-and-import-from]
 from logging import CRITICAL, Formatter, NOTSET, StreamHandler, WARN, getLogger
 import os
+from os.path import dirname, isdir, isfile, join
 import signal
-import sys
-from threading import Event, Thread
-from time import sleep
+from threading import Event, Thread, Lock
+from time import sleep, time
 
-from concurrent.futures import ThreadPoolExecutor
-from enum import Enum
-from math import floor
-
-from .compat import StringIO, iteritems, on_win
+from .compat import StringIO, iteritems, on_win, encode_environment
 from .constants import NULL
+from .path import expand
+from .._vendor.auxlib.decorators import memoizemethod
 from .._vendor.auxlib.logz import NullHandler
+from .._vendor.auxlib.type_coercion import boolify
 from .._vendor.tqdm import tqdm
 
 log = getLogger(__name__)
 
-_FORMATTER = Formatter("%(levelname)s %(name)s:%(funcName)s(%(lineno)d): %(message)s")
+
+class DeltaSecondsFormatter(Formatter):
+    """
+    Logging formatter with additional attributes for run time logging.
+
+    Attributes:
+      `delta_secs`:
+        Elapsed seconds since last log/format call (or creation of logger).
+      `relative_created_secs`:
+        Like `relativeCreated`, time relative to the initialization of the
+        `logging` module but conveniently scaled to seconds as a `float` value.
+    """
+    def __init__(self, fmt=None, datefmt=None):
+        self.prev_time = time()
+        super(DeltaSecondsFormatter, self).__init__(fmt=fmt, datefmt=datefmt)
+
+    def format(self, record):
+        now = time()
+        prev_time = self.prev_time
+        self.prev_time = max(self.prev_time, now)
+        record.delta_secs = now - prev_time
+        record.relative_created_secs = record.relativeCreated / 1000
+        return super(DeltaSecondsFormatter, self).format(record)
+
+
+if boolify(os.environ.get('CONDA_TIMED_LOGGING')):
+    _FORMATTER = DeltaSecondsFormatter(
+        "%(relative_created_secs) 7.2f %(delta_secs) 7.2f "
+        "%(levelname)s %(name)s:%(funcName)s(%(lineno)d): %(message)s"
+    )
+else:
+    _FORMATTER = Formatter(
+        "%(levelname)s %(name)s:%(funcName)s(%(lineno)d): %(message)s"
+    )
+
+
+def dashlist(iterable, indent=2):
+    return ''.join('\n' + ' ' * indent + '- ' + str(x) for x in iterable)
+
+
+class ContextDecorator(object):
+    """Base class for a context manager class (implementing __enter__() and __exit__()) that also
+    makes it a decorator.
+    """
+
+    # TODO: figure out how to improve this pattern so e.g. swallow_broken_pipe doesn't have to be instantiated  # NOQA
+
+    def __call__(self, f):
+        @wraps(f)
+        def decorated(*args, **kwds):
+            with self:
+                return f(*args, **kwds)
+        return decorated
+
+
+class SwallowBrokenPipe(ContextDecorator):
+    # Ignore BrokenPipeError and errors related to stdout or stderr being
+    # closed by a downstream program.
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if (exc_val
+                and isinstance(exc_val, EnvironmentError)
+                and getattr(exc_val, 'errno', None)
+                and exc_val.errno in (EPIPE, ESHUTDOWN)):
+            return True
+
+
+swallow_broken_pipe = SwallowBrokenPipe()
 
 
 class CaptureTarget(Enum):
     """Constants used for contextmanager captured.
 
-    Used similarily like the constants PIPE, STDOUT for stdlib's subprocess.Popen.
+    Used similarly like the constants PIPE, STDOUT for stdlib's subprocess.Popen.
     """
     STRING = -1
     STDOUT = -2
 
 
 @contextmanager
-def env_var(name, value, callback=None):
-    # NOTE: will likely want to call reset_context() when using this function, so pass
-    #       it as callback
-    name, value = str(name), str(value)
-    saved_env_var = os.environ.get(name)
-    try:
+def env_vars(var_map=None, callback=None, stack_callback=None):
+
+    if var_map is None:
+        var_map = {}
+
+    new_var_map = encode_environment(var_map)
+    saved_vars = {}
+    for name, value in iteritems(new_var_map):
+        saved_vars[name] = os.environ.get(name, NULL)
         os.environ[name] = value
-        if callback:
-            callback()
-        yield
-    finally:
-        if saved_env_var:
-            os.environ[name] = saved_env_var
-        else:
-            del os.environ[name]
-        if callback:
-            callback()
-
-
-@contextmanager
-def env_vars(var_map, callback=None):
-    # NOTE: will likely want to call reset_context() when using this function, so pass
-    #       it as callback
-    saved_vars = {str(name): os.environ.get(name, NULL) for name in var_map}
     try:
-        for name, value in iteritems(var_map):
-            os.environ[str(name)] = str(value)
         if callback:
             callback()
+        if stack_callback:
+            stack_callback(True)
         yield
     finally:
         for name, value in iteritems(saved_vars):
@@ -73,6 +141,23 @@ def env_vars(var_map, callback=None):
                 os.environ[name] = value
         if callback:
             callback()
+        if stack_callback:
+            stack_callback(False)
+
+@contextmanager
+def env_var(name, value, callback=None, stack_callback=None):
+    # Maybe, but in env_vars, not here:
+    #    from conda.compat import ensure_fs_path_encoding
+    #    d = dict({name: ensure_fs_path_encoding(value)})
+    d = {name: value}
+    with env_vars(d, callback=callback, stack_callback=stack_callback) as es:
+        yield es
+
+
+@contextmanager
+def env_unmodified(callback=None):
+    with env_vars(callback=callback) as es:
+        yield es
 
 
 @contextmanager
@@ -109,17 +194,48 @@ def captured(stdout=CaptureTarget.STRING, stderr=CaptureTarget.STRING):
     # >>> c.stdout
     # 'hello world!\n'
     # """
+    def write_wrapper(self, to_write):
+        # This may have to deal with a *lot* of text.
+        if hasattr(self, 'mode') and 'b' in self.mode:
+            wanted = bytes
+        elif sys.version_info[0] == 3 and isinstance(self, BytesIO):
+            wanted = bytes
+        else:
+            # ignore flake8 on this because it finds an error on py3 even though it is guarded
+            if sys.version_info[0] == 2:
+                wanted = unicode  # NOQA
+            else:
+                wanted = str
+        if not isinstance(to_write, wanted):
+            if hasattr(to_write, 'decode'):
+                decoded = to_write.decode('utf-8')
+                self.old_write(decoded)
+            elif hasattr(to_write, 'encode'):
+                b = to_write.encode('utf-8')
+                self.old_write(b)
+        else:
+            self.old_write(to_write)
+
     class CapturedText(object):
         pass
+    # sys.stdout.write(u'unicode out')
+    # sys.stdout.write(bytes('bytes out', encoding='utf-8'))
+    # sys.stdout.write(str('str out'))
     saved_stdout, saved_stderr = sys.stdout, sys.stderr
     if stdout == CaptureTarget.STRING:
-        sys.stdout = outfile = StringIO()
+        outfile = StringIO()
+        outfile.old_write = outfile.write
+        outfile.write = partial(write_wrapper, outfile)
+        sys.stdout = outfile
     else:
         outfile = stdout
         if outfile is not None:
             sys.stdout = outfile
     if stderr == CaptureTarget.STRING:
-        sys.stderr = errfile = StringIO()
+        errfile = StringIO()
+        errfile.old_write = errfile.write
+        errfile.write = partial(write_wrapper, errfile)
+        sys.stderr = errfile
     elif stderr == CaptureTarget.STDOUT:
         sys.stderr = errfile = outfile
     else:
@@ -255,20 +371,36 @@ def timeout(timeout_secs, func, *args, **kwargs):
 
 
 class Spinner(object):
+    """
+    Args:
+        message (str):
+            A message to prefix the spinner with. The string ': ' is automatically appended.
+        enabled (bool):
+            If False, usage is a no-op.
+        json (bool):
+           If True, will not output non-json to stdout.
+
+    """
+
     # spinner_cycle = cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
     spinner_cycle = cycle('/-\\|')
 
-    def __init__(self, enable_spin=True):
+    def __init__(self, message, enabled=True, json=False, fail_message="failed\n"):
+        self.message = message
+        self.enabled = enabled
+        self.json = json
+
         self._stop_running = Event()
         self._spinner_thread = Thread(target=self._start_spinning)
         self._indicator_length = len(next(self.spinner_cycle)) + 1
         self.fh = sys.stdout
-        self.show_spin = enable_spin and hasattr(self.fh, "isatty") and self.fh.isatty()
+        self.show_spin = enabled and not json and hasattr(self.fh, "isatty") and self.fh.isatty()
+        self.fail_message = fail_message
 
     def start(self):
         if self.show_spin:
             self._spinner_thread.start()
-        else:
+        elif not self.json:
             self.fh.write("...working... ")
             self.fh.flush()
 
@@ -276,52 +408,34 @@ class Spinner(object):
         if self.show_spin:
             self._stop_running.set()
             self._spinner_thread.join()
+            self.show_spin = False
 
     def _start_spinning(self):
-        while not self._stop_running.is_set():
-            self.fh.write(next(self.spinner_cycle) + ' ')
-            self.fh.flush()
-            sleep(0.10)
-            self.fh.write('\b' * self._indicator_length)
-
-
-@contextmanager
-def spinner(message=None, enabled=True, json=False):
-    """
-    Args:
-        message (str, optional):
-            An optional message to prefix the spinner with.
-            If given, ': ' are automatically added.
-        enabled (bool):
-            If False, usage is a no-op.
-        json (bool):
-           If True, will not output non-json to stdout.
-
-    """
-    sp = Spinner(enabled)
-    exception_raised = False
-    try:
-        if message:
-            if json:
-                pass
+        try:
+            while not self._stop_running.is_set():
+                self.fh.write(next(self.spinner_cycle) + ' ')
+                self.fh.flush()
+                sleep(0.10)
+                self.fh.write('\b' * self._indicator_length)
+        except EnvironmentError as e:
+            if e.errno in (EPIPE, ESHUTDOWN):
+                self.stop()
             else:
-                sys.stdout.write("%s: " % message)
-                sys.stdout.flush()
-        if not json:
-            sp.start()
-        yield
-    except:
-        exception_raised = True
-        raise
-    finally:
-        if not json:
-            sp.stop()
-        if message:
-            if json:
-                pass
-            else:
-                if exception_raised:
-                    sys.stdout.write("failed\n")
+                raise
+
+    @swallow_broken_pipe
+    def __enter__(self):
+        if not self.json:
+            sys.stdout.write("%s: " % self.message)
+            sys.stdout.flush()
+        self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        if not self.json:
+            with swallow_broken_pipe:
+                if exc_type or exc_val:
+                    sys.stdout.write(self.fail_message)
                 else:
                     sys.stdout.write("done\n")
                 sys.stdout.flush()
@@ -349,40 +463,211 @@ class ProgressBar(object):
             pass
         elif enabled:
             bar_format = "{desc}{bar} | {percentage:3.0f}% "
-            self.pbar = tqdm(desc=description, bar_format=bar_format, ascii=True, total=1)
+            try:
+                self.pbar = tqdm(desc=description, bar_format=bar_format, ascii=True, total=1,
+                                 file=sys.stdout)
+            except EnvironmentError as e:
+                if e.errno in (EPIPE, ESHUTDOWN):
+                    self.enabled = False
+                else:
+                    raise
 
     def update_to(self, fraction):
-        if self.json:
-            sys.stdout.write('{"fetch":"%s","finished":false,"maxval":1,"progress":%f}\n\0'
-                             % (self.description, fraction))
-        elif self.enabled:
-            self.pbar.update(fraction - self.pbar.n)
+        try:
+            if self.json and self.enabled:
+                sys.stdout.write('{"fetch":"%s","finished":false,"maxval":1,"progress":%f}\n\0'
+                                 % (self.description, fraction))
+            elif self.enabled:
+                self.pbar.update(fraction - self.pbar.n)
+        except EnvironmentError as e:
+            if e.errno in (EPIPE, ESHUTDOWN):
+                self.enabled = False
+            else:
+                raise
 
     def finish(self):
         self.update_to(1)
 
+    @swallow_broken_pipe
     def close(self):
-        if self.json:
+        if self.enabled and self.json:
             sys.stdout.write('{"fetch":"%s","finished":true,"maxval":1,"progress":1}\n\0'
                              % self.description)
             sys.stdout.flush()
         elif self.enabled:
             self.pbar.close()
-        self.enabled = False
 
 
-@contextmanager
-def backdown_thread_pool(max_workers=10):
-    """Tries to create an executor with max_workers, but will back down ultimately to a single
-    thread of the OS decides you can't have more than one.
-    """
-    try:
-        yield ThreadPoolExecutor(max_workers)
-    except RuntimeError as e:  # pragma: no cover
-        # RuntimeError is thrown if number of threads are limited by OS
-        log.debug(repr(e))
-        try:
-            yield ThreadPoolExecutor(floor(max_workers / 2))
-        except RuntimeError as e:
-            log.debug(repr(e))
-            yield ThreadPoolExecutor(1)
+# use this for debugging, because ProcessPoolExecutor isn't pdb/ipdb friendly
+class DummyExecutor(Executor):
+    def __init__(self):
+        self._shutdown = False
+        self._shutdownLock = Lock()
+
+    def submit(self, fn, *args, **kwargs):
+        with self._shutdownLock:
+            if self._shutdown:
+                raise RuntimeError('cannot schedule new futures after shutdown')
+
+            f = Future()
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as e:
+                f.set_exception(e)
+            else:
+                f.set_result(result)
+
+            return f
+
+    def map(self, func, *iterables):
+        for iterable in iterables:
+            for thing in iterable:
+                yield func(thing)
+
+    def shutdown(self, wait=True):
+        with self._shutdownLock:
+            self._shutdown = True
+
+
+class ThreadLimitedThreadPoolExecutor(ThreadPoolExecutor):
+
+    def __init__(self, max_workers=10):
+        super(ThreadLimitedThreadPoolExecutor, self).__init__(max_workers)
+
+    def submit(self, fn, *args, **kwargs):
+        """
+        This is an exact reimplementation of the `submit()` method on the parent class, except
+        with an added `try/except` around `self._adjust_thread_count()`.  So long as there is at
+        least one living thread, this thread pool will not throw an exception if threads cannot
+        be expanded to `max_workers`.
+
+        In the implementation, we use "protected" attributes from concurrent.futures (`_base`
+        and `_WorkItem`). Consider vendoring the whole concurrent.futures library
+        as an alternative to these protected imports.
+
+        https://github.com/agronholm/pythonfutures/blob/3.2.0/concurrent/futures/thread.py#L121-L131  # NOQA
+        https://github.com/python/cpython/blob/v3.6.4/Lib/concurrent/futures/thread.py#L114-L124
+        """
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError('cannot schedule new futures after shutdown')
+
+            f = _base.Future()
+            w = _WorkItem(f, fn, args, kwargs)
+
+            self._work_queue.put(w)
+            try:
+                self._adjust_thread_count()
+            except RuntimeError:
+                # RuntimeError: can't start new thread
+                # See https://github.com/conda/conda/issues/6624
+                if len(self._threads) > 0:
+                    # It's ok to not be able to start new threads if we already have at least
+                    # one thread alive.
+                    pass
+                else:
+                    raise
+            return f
+
+
+as_completed = as_completed
+
+def get_instrumentation_record_file():
+    default_record_file = join('~', '.conda', 'instrumentation-record.csv')
+    return expand(os.environ.get("CONDA_INSTRUMENTATION_RECORD_FILE", default_record_file))
+
+
+class time_recorder(ContextDecorator):  # pragma: no cover
+    record_file = get_instrumentation_record_file()
+    start_time = None
+    total_call_num = defaultdict(int)
+    total_run_time = defaultdict(float)
+
+    def __init__(self, entry_name=None, module_name=None):
+        self.entry_name = entry_name
+        self.module_name = module_name
+
+    def _set_entry_name(self, f):
+        if self.entry_name is None:
+            if hasattr(f, '__qualname__'):
+                entry_name = f.__qualname__
+            else:
+                entry_name = ':' + f.__name__
+            if self.module_name:
+                entry_name = '.'.join((self.module_name, entry_name))
+            self.entry_name = entry_name
+
+    def __call__(self, f):
+        self._set_entry_name(f)
+        return super(time_recorder, self).__call__(f)
+
+    def __enter__(self):
+        enabled = os.environ.get('CONDA_INSTRUMENTATION_ENABLED')
+        if enabled and boolify(enabled):
+            self.start_time = time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.start_time:
+            entry_name = self.entry_name
+            end_time = time()
+            run_time = end_time - self.start_time
+            self.total_call_num[entry_name] += 1
+            self.total_run_time[entry_name] += run_time
+            self._ensure_dir()
+            with open(self.record_file, 'a') as fh:
+                fh.write("%s,%f\n" % (entry_name, run_time))
+            # total_call_num = self.total_call_num[entry_name]
+            # total_run_time = self.total_run_time[entry_name]
+            # log.debug('%s %9.3f %9.3f %d', entry_name, run_time, total_run_time, total_call_num)
+
+    @classmethod
+    def log_totals(cls):
+        enabled = os.environ.get('CONDA_INSTRUMENTATION_ENABLED')
+        if not (enabled and boolify(enabled)):
+            return
+        log.info('=== time_recorder total time and calls ===')
+        for entry_name in sorted(cls.total_run_time.keys()):
+            log.info(
+                'TOTAL %9.3f % 9d %s',
+                cls.total_run_time[entry_name],
+                cls.total_call_num[entry_name],
+                entry_name,
+            )
+
+    @memoizemethod
+    def _ensure_dir(self):
+        if not isdir(dirname(self.record_file)):
+            os.makedirs(dirname(self.record_file))
+
+
+def print_instrumentation_data():  # pragma: no cover
+    record_file = get_instrumentation_record_file()
+
+    grouped_data = defaultdict(list)
+    final_data = {}
+
+    if not isfile(record_file):
+        return
+
+    with open(record_file) as fh:
+        for line in fh:
+            entry_name, total_time = line.strip().split(',')
+            grouped_data[entry_name].append(float(total_time))
+
+    for entry_name in sorted(grouped_data):
+        all_times = grouped_data[entry_name]
+        counts = len(all_times)
+        total_time = sum(all_times)
+        average_time = total_time / counts
+        final_data[entry_name] = {
+            'counts': counts,
+            'total_time': total_time,
+            'average_time': average_time,
+        }
+
+    print(json.dumps(final_data, sort_keys=True, indent=2, separators=(',', ': ')))
+
+
+if __name__ == "__main__":
+    print_instrumentation_data()

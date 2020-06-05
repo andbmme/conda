@@ -1,5 +1,6 @@
 from collections import defaultdict, namedtuple
 from contextlib import contextmanager
+from functools import partial
 import os
 from os.path import join
 import random
@@ -8,18 +9,19 @@ import unittest
 import pytest
 
 from conda import CondaError
-from conda.base.context import context, reset_context
+from conda.base.context import context, stack_context, conda_tests_ctxt_mgmt_def_pol
 from conda.cli.python_api import Commands, run_command
 from conda.common.io import env_var
 from conda.core.solve import get_pinned_specs
 from conda.exceptions import PackagesNotFoundError
 from conda.gateways.disk.create import mkdir_p
 import conda.instructions as inst
+from conda.models.channel import Channel
 from conda.models.dist import Dist
-from conda.models.index_record import IndexRecord
+from conda.models.records import PackageRecord
 from conda.models.match_spec import MatchSpec
-from conda.plan import display_actions
-import conda.plan as plan
+from conda.plan import display_actions, add_unlink, add_defaults_to_specs, _update_old_plan as update_old_plan
+from conda.exports import execute_plan
 from .decorators import skip_if_no_mock
 from .gateways.disk.test_permissions import tempdir
 from .helpers import captured, get_index_r_1, mock, tempdir
@@ -31,6 +33,11 @@ try:
     from unittest.mock import patch
 except ImportError:
     from mock import patch
+
+
+def get_matchspec_from_index(index, match_spec_str):
+    ms = MatchSpec(match_spec_str)
+    return next(prec for prec in index if ms.match(prec))
 
 
 def DPkg(s, **kwargs):
@@ -46,7 +53,7 @@ def DPkg(s, **kwargs):
         md5="012345789",
     )
     _kwargs.update(kwargs)
-    return IndexRecord(**_kwargs)
+    return PackageRecord(**_kwargs)
 
 def solve(specs):
     return [Dist.from_string(fn) for fn in r.solve(specs)]
@@ -58,6 +65,7 @@ class add_unlink_TestCase(unittest.TestCase):
 
     @contextmanager
     def mock_platform(self, windows=False):
+        from conda import plan
         with mock.patch.object(plan, "sys") as sys:
             sys.platform = "win32" if windows else "not win32"
             yield sys
@@ -67,7 +75,7 @@ class add_unlink_TestCase(unittest.TestCase):
         actions = {}
         dist = Dist.from_string(self.generate_random_dist())
         with self.mock_platform(windows=False):
-            plan.add_unlink(actions, dist)
+            add_unlink(actions, dist)
         self.assertIn(inst.UNLINK, actions)
         self.assertEqual(actions[inst.UNLINK], [dist, ])
 
@@ -76,7 +84,7 @@ class add_unlink_TestCase(unittest.TestCase):
         actions = {inst.UNLINK: [{"foo": "bar"}]}
         dist = Dist.from_string(self.generate_random_dist())
         with self.mock_platform(windows=False):
-            plan.add_unlink(actions, dist)
+            add_unlink(actions, dist)
         self.assertEqual(2, len(actions[inst.UNLINK]))
 
 
@@ -85,71 +93,23 @@ class TestAddDeaultsToSpec(unittest.TestCase):
 
     def check(self, specs, added):
         new_specs = list(specs + added)
-        plan.add_defaults_to_specs(r, self.linked, specs)
+        add_defaults_to_specs(r, self.linked, specs)
         specs = [s.split(' (')[0] for s in specs]
         self.assertEqual(specs, new_specs)
 
-    # def test_1(self):
-    #     self.linked = solve(['anaconda 1.5.0', 'python 2.7*', 'numpy 1.7*'])
-    #     for specs, added in [
-    #         (['python 3*'], []),
-    #         (['python'], ['python 2.7*']),
-    #         (['scipy'], ['python 2.7*']),
-    #         ]:
-    #         self.check(specs, added)
-    #
-    # def test_2(self):
-    #     self.linked = solve(['anaconda 1.5.0', 'python 2.6*', 'numpy 1.6*'])
-    #     for specs, added in [
-    #         (['python'], ['python 2.6*']),
-    #         (['numpy'], ['python 2.6*']),
-    #         (['pandas'], ['python 2.6*']),
-    #         # however, this would then be unsatisfiable
-    #         (['python 3*', 'numpy'], []),
-    #         ]:
-    #         self.check(specs, added)
-    #
-    # def test_3(self):
-    #     self.linked = solve(['anaconda 1.5.0', 'python 3.3*'])
-    #     for specs, added in [
-    #         (['python'], ['python 3.3*']),
-    #         (['numpy'], ['python 3.3*']),
-    #         (['scipy'], ['python 3.3*']),
-    #         ]:
-    #         self.check(specs, added)
-    #
-    # def test_4(self):
-    #     self.linked = []
-    #     for dp in ('2.7', '3.5'):
-    #         with env_var('CONDA_DEFAULT_PYTHON', dp, reset_context):
-    #             ps = ['python 2.7*'] if context.default_python == '2.7' else []
-    #             for specs, added in [
-    #                 (['python'], ps),
-    #                 (['numpy'], ps),
-    #                 (['scipy'], ps),
-    #                 (['anaconda'], ps),
-    #                 (['anaconda 1.5.0 np17py27_0'], []),
-    #                 (['sympy 0.7.2 py27_0'], []),
-    #                 (['scipy 0.12.0 np16py27_0'], []),
-    #                 (['anaconda', 'python 3*'], []),
-    #                 ]:
-    #                 self.check(specs, added)
-
 
 def test_display_actions_0():
-    os.environ['CONDA_SHOW_CHANNEL_URLS'] = 'False'
-    reset_context(())
-    actions = defaultdict(list, {"FETCH": [Dist('channel-1::sympy-0.7.2-py27_0'), Dist("channel-1::numpy-1.7.1-py27_0")]})
-    # The older test index doesn't have the size metadata
-    d = Dist.from_string('channel-1::sympy-0.7.2-py27_0.tar.bz2')
-    index[d] = IndexRecord.from_objects(index[d], size=4374752)
-    d = Dist.from_string("channel-1::numpy-1.7.1-py27_0.tar.bz2")
-    index[d] = IndexRecord.from_objects(index[d], size=5994338)
+    with env_var('CONDA_SHOW_CHANNEL_URLS', 'False', stack_callback=conda_tests_ctxt_mgmt_def_pol):
+        actions = defaultdict(list)
+        actions.update({"FETCH": [
+            get_matchspec_from_index(index, "channel-1::sympy==0.7.2=py27_0"),
+            get_matchspec_from_index(index, "channel-1::numpy==1.7.1=py27_0"),
+        ]})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -164,15 +124,23 @@ The following packages will be downloaded:
 
 """
 
-    actions = defaultdict(list, {'PREFIX':
-    '/Users/aaronmeurer/anaconda/envs/test', 'SYMLINK_CONDA':
-    ['/Users/aaronmeurer/anaconda'], 'LINK': ['channel-1::python-3.3.2-0', 'channel-1::readline-6.2-0 1', 'channel-1::sqlite-3.7.13-0 1', 'channel-1::tk-8.5.13-0 1', 'channel-1::zlib-1.2.7-0 1']})
+        actions = defaultdict(list)
+        actions.update({
+            'PREFIX': '/Users/aaronmeurer/anaconda/envs/test',
+            'SYMLINK_CONDA': ['/Users/aaronmeurer/anaconda'],
+            'LINK': [
+                get_matchspec_from_index(index, "channel-1::python==3.3.2=0"),
+                get_matchspec_from_index(index, "channel-1::readline==6.2=0"),
+                get_matchspec_from_index(index, "channel-1::sqlite==3.7.13=0"),
+                get_matchspec_from_index(index, "channel-1::tk==8.5.13=0"),
+                get_matchspec_from_index(index, "channel-1::zlib==1.2.7=0"),
+            ]
+        })
+        with captured() as c:
+            display_actions(actions, index)
 
-    with captured() as c:
-        display_actions(actions, index)
 
-
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
   environment location: /Users/aaronmeurer/anaconda/envs/test
@@ -188,13 +156,13 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions['UNLINK'] = actions['LINK']
-    actions['LINK'] = []
+        actions['UNLINK'] = actions['LINK']
+        actions['LINK'] = []
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
   environment location: /Users/aaronmeurer/anaconda/envs/test
@@ -210,13 +178,20 @@ The following packages will be REMOVED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::cython-0.19.1-py33_0'], 'UNLINK':
-    ['channel-1::cython-0.19-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, "channel-1::cython==0.19.1=py33_0"),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, "channel-1::cython==0.19=py33_0"),
+            ],
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -226,12 +201,12 @@ The following packages will be UPDATED:
 
 """
 
-    actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
+        actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -241,14 +216,23 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::cython-0.19.1-py33_0',
-        'channel-1::dateutil-1.5-py33_0', 'channel-1::numpy-1.7.1-py33_0'], 'UNLINK':
-        ['channel-1::cython-0.19-py33_0', 'channel-1::dateutil-2.1-py33_1', 'channel-1::pip-1.3.1-py33_1']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19.1=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==1.5=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==2.1=py33_1'),
+                get_matchspec_from_index(index, 'channel-1::pip==1.3.1=py33_1'),
+            ]})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -270,14 +254,22 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::cython-0.19.1-py33_0',
-        'channel-1::dateutil-2.1-py33_1'], 'UNLINK':  ['channel-1::cython-0.19-py33_0',
-            'channel-1::dateutil-1.5-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19.1=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==2.1=py33_1'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==1.5=py33_0'),
+            ],
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -288,12 +280,12 @@ The following packages will be UPDATED:
 
 """
 
-    actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
+        actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -306,20 +298,22 @@ The following packages will be DOWNGRADED:
 
 
 def test_display_actions_show_channel_urls():
-    os.environ['CONDA_SHOW_CHANNEL_URLS'] = 'True'
-    reset_context(())
-    actions = defaultdict(list, {"FETCH": ['sympy-0.7.2-py27_0',
-        "numpy-1.7.1-py27_0"]})
-    # The older test index doesn't have the size metadata
-    d = Dist('sympy-0.7.2-py27_0.tar.bz2')
-    index[d] = DPkg(d, size=4374752)
-    d = Dist('numpy-1.7.1-py27_0.tar.bz2')
-    index[d] = DPkg(d, size=5994338)
+    with env_var('CONDA_SHOW_CHANNEL_URLS', 'True', stack_callback=conda_tests_ctxt_mgmt_def_pol):
+        actions = defaultdict(list)
+        sympy_prec = PackageRecord.from_objects(get_matchspec_from_index(index, 'channel-1::sympy==0.7.2=py27_0'))
+        numpy_prec = PackageRecord.from_objects(get_matchspec_from_index(index, "channel-1::numpy==1.7.1=py27_0"))
+        numpy_prec.channel = sympy_prec.channel = Channel(None)
+        actions.update({
+            "FETCH": [
+                sympy_prec,
+                numpy_prec,
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -334,14 +328,25 @@ The following packages will be downloaded:
 
 """
 
-    actions = defaultdict(list, {'PREFIX':
-    '/Users/aaronmeurer/anaconda/envs/test', 'SYMLINK_CONDA':
-    ['/Users/aaronmeurer/anaconda'], 'LINK': ['channel-1::python-3.3.2-0', 'channel-1::readline-6.2-0', 'channel-1::sqlite-3.7.13-0', 'channel-1::tk-8.5.13-0', 'channel-1::zlib-1.2.7-0']})
+        actions = defaultdict(list)
+        actions.update({
+            'PREFIX': '/Users/aaronmeurer/anaconda/envs/test',
+            'SYMLINK_CONDA': [
+                '/Users/aaronmeurer/anaconda',
+            ],
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::python==3.3.2=0'),
+                get_matchspec_from_index(index, 'channel-1::readline==6.2=0'),
+                get_matchspec_from_index(index, 'channel-1::sqlite==3.7.13=0'),
+                get_matchspec_from_index(index, 'channel-1::tk==8.5.13=0'),
+                get_matchspec_from_index(index, 'channel-1::zlib==1.2.7=0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
   environment location: /Users/aaronmeurer/anaconda/envs/test
@@ -357,13 +362,13 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions['UNLINK'] = actions['LINK']
-    actions['LINK'] = []
+        actions['UNLINK'] = actions['LINK']
+        actions['LINK'] = []
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
   environment location: /Users/aaronmeurer/anaconda/envs/test
@@ -379,13 +384,20 @@ The following packages will be REMOVED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::cython-0.19.1-py33_0'], 'UNLINK':
-    ['channel-1::cython-0.19-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19.1=py33_0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -395,12 +407,12 @@ The following packages will be UPDATED:
 
 """
 
-    actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
+        actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -410,14 +422,24 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::cython-0.19.1-py33_0',
-        'channel-1::dateutil-1.5-py33_0', 'channel-1::numpy-1.7.1-py33_0'], 'UNLINK':
-        ['channel-1::cython-0.19-py33_0', 'channel-1::dateutil-2.1-py33_1', 'channel-1::pip-1.3.1-py33_1']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19.1=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==1.5=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==2.1=py33_1'),
+                get_matchspec_from_index(index, 'channel-1::pip==1.3.1=py33_1'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -439,14 +461,22 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::cython-0.19.1-py33_0',
-        'channel-1::dateutil-2.1-py33_1'], 'UNLINK':  ['channel-1::cython-0.19-py33_0',
-            'channel-1::dateutil-1.5-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19.1=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==2.1=py33_1'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+                get_matchspec_from_index(index, 'channel-1::dateutil==1.5=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -457,12 +487,12 @@ The following packages will be UPDATED:
 
 """
 
-    actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
+        actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -473,17 +503,27 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
+        cython_prec = PackageRecord.from_objects(get_matchspec_from_index(index, 'channel-1::cython==0.19.1=py33_0'))
+        dateutil_prec = PackageRecord.from_objects(get_matchspec_from_index(index, 'channel-1::dateutil==1.5=py33_0'))
+        cython_prec.channel = dateutil_prec.channel = Channel("my_channel")
 
-    d = Dist('channel-1::cython-0.19.1-py33_0.tar.bz2')
-    index[d] = DPkg(d, channel='my_channel')
-    d = Dist('channel-1::dateutil-1.5-py33_0.tar.bz2')
-    index[d] = DPkg(d, channel='my_channel')
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                cython_prec,
+                get_matchspec_from_index(index, 'channel-1::dateutil==2.1=py33_1'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+                dateutil_prec,
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
 
-    assert c.stdout == """
+        with captured() as c:
+            display_actions(actions, index)
+
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -494,12 +534,12 @@ The following packages will be UPDATED:
 
 """
 
-    actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
+        actions['LINK'], actions['UNLINK'] = actions['UNLINK'], actions['LINK']
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -514,16 +554,15 @@ The following packages will be DOWNGRADED:
 @pytest.mark.xfail(strict=True, reason="Not reporting link type until refactoring display_actions "
                                        "after txn.verify()")
 def test_display_actions_link_type():
-    os.environ['CONDA_SHOW_CHANNEL_URLS'] = 'False'
-    reset_context(())
+    with env_var('CONDA_SHOW_CHANNEL_URLS', 'False', stack_callback=conda_tests_ctxt_mgmt_def_pol):
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 2', 'dateutil-1.5-py33_0 2',
-    'numpy-1.7.1-py33_0 2', 'python-3.3.2-0 2', 'readline-6.2-0 2', 'sqlite-3.7.13-0 2', 'tk-8.5.13-0 2', 'zlib-1.2.7-0 2']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 2', 'dateutil-1.5-py33_0 2',
+        'numpy-1.7.1-py33_0 2', 'python-3.3.2-0 2', 'readline-6.2-0 2', 'sqlite-3.7.13-0 2', 'tk-8.5.13-0 2', 'zlib-1.2.7-0 2']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following NEW packages will be INSTALLED:
 
     cython:   0.19.1-py33_0 (softlink)
@@ -537,14 +576,14 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 2',
-        'dateutil-2.1-py33_1 2'], 'UNLINK':  ['cython-0.19-py33_0',
-            'dateutil-1.5-py33_0']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 2',
+            'dateutil-2.1-py33_1 2'], 'UNLINK':  ['cython-0.19-py33_0',
+                'dateutil-1.5-py33_0']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be UPDATED:
 
     cython:   0.19-py33_0 --> 0.19.1-py33_0 (softlink)
@@ -552,14 +591,14 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 2',
-        'dateutil-1.5-py33_0 2'], 'UNLINK':  ['cython-0.19.1-py33_0',
-            'dateutil-2.1-py33_1']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 2',
+            'dateutil-1.5-py33_0 2'], 'UNLINK':  ['cython-0.19.1-py33_0',
+                'dateutil-2.1-py33_1']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be DOWNGRADED:
 
     cython:   0.19.1-py33_0 --> 0.19-py33_0 (softlink)
@@ -567,13 +606,13 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 1', 'dateutil-1.5-py33_0 1',
-    'numpy-1.7.1-py33_0 1', 'python-3.3.2-0 1', 'readline-6.2-0 1', 'sqlite-3.7.13-0 1', 'tk-8.5.13-0 1', 'zlib-1.2.7-0 1']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 1', 'dateutil-1.5-py33_0 1',
+        'numpy-1.7.1-py33_0 1', 'python-3.3.2-0 1', 'readline-6.2-0 1', 'sqlite-3.7.13-0 1', 'tk-8.5.13-0 1', 'zlib-1.2.7-0 1']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following NEW packages will be INSTALLED:
 
     cython:   0.19.1-py33_0
@@ -587,14 +626,14 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 1',
-        'dateutil-2.1-py33_1 1'], 'UNLINK':  ['cython-0.19-py33_0',
-            'dateutil-1.5-py33_0']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 1',
+            'dateutil-2.1-py33_1 1'], 'UNLINK':  ['cython-0.19-py33_0',
+                'dateutil-1.5-py33_0']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be UPDATED:
 
     cython:   0.19-py33_0 --> 0.19.1-py33_0
@@ -602,14 +641,14 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 1',
-        'dateutil-1.5-py33_0 1'], 'UNLINK':  ['cython-0.19.1-py33_0',
-            'dateutil-2.1-py33_1']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 1',
+            'dateutil-1.5-py33_0 1'], 'UNLINK':  ['cython-0.19.1-py33_0',
+                'dateutil-2.1-py33_1']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be DOWNGRADED:
 
     cython:   0.19.1-py33_0 --> 0.19-py33_0
@@ -617,13 +656,13 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3', 'dateutil-1.5-py33_0 3',
-    'numpy-1.7.1-py33_0 3', 'python-3.3.2-0 3', 'readline-6.2-0 3', 'sqlite-3.7.13-0 3', 'tk-8.5.13-0 3', 'zlib-1.2.7-0 3']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3', 'dateutil-1.5-py33_0 3',
+        'numpy-1.7.1-py33_0 3', 'python-3.3.2-0 3', 'readline-6.2-0 3', 'sqlite-3.7.13-0 3', 'tk-8.5.13-0 3', 'zlib-1.2.7-0 3']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following NEW packages will be INSTALLED:
 
     cython:   0.19.1-py33_0 (copy)
@@ -637,14 +676,14 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3',
-        'dateutil-2.1-py33_1 3'], 'UNLINK':  ['cython-0.19-py33_0',
-            'dateutil-1.5-py33_0']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3',
+            'dateutil-2.1-py33_1 3'], 'UNLINK':  ['cython-0.19-py33_0',
+                'dateutil-1.5-py33_0']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be UPDATED:
 
     cython:   0.19-py33_0 --> 0.19.1-py33_0 (copy)
@@ -652,36 +691,35 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 3',
-        'dateutil-1.5-py33_0 3'], 'UNLINK':  ['cython-0.19.1-py33_0',
-            'dateutil-2.1-py33_1']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 3',
+            'dateutil-1.5-py33_0 3'], 'UNLINK':  ['cython-0.19.1-py33_0',
+                'dateutil-2.1-py33_1']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be DOWNGRADED:
 
     cython:   0.19.1-py33_0 --> 0.19-py33_0 (copy)
     dateutil: 2.1-py33_1    --> 1.5-py33_0  (copy)
 
 """
-    os.environ['CONDA_SHOW_CHANNEL_URLS'] = 'True'
-    reset_context(())
+    with env_var('CONDA_SHOW_CHANNEL_URLS', 'True', stack_callback=conda_tests_ctxt_mgmt_def_pol):
 
-    d = Dist('cython-0.19.1-py33_0.tar.bz2')
-    index[d] = IndexRecord.from_objects(index[d], channel='my_channel')
+        d = Dist('cython-0.19.1-py33_0.tar.bz2')
+        index[d] = PackageRecord.from_objects(index[d], channel='my_channel')
 
-    d = Dist('dateutil-1.5-py33_0.tar.bz2')
-    index[d] = IndexRecord.from_objects(index[d], channel='my_channel')
+        d = Dist('dateutil-1.5-py33_0.tar.bz2')
+        index[d] = PackageRecord.from_objects(index[d], channel='my_channel')
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3', 'dateutil-1.5-py33_0 3',
-    'numpy-1.7.1-py33_0 3', 'python-3.3.2-0 3', 'readline-6.2-0 3', 'sqlite-3.7.13-0 3', 'tk-8.5.13-0 3', 'zlib-1.2.7-0 3']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3', 'dateutil-1.5-py33_0 3',
+        'numpy-1.7.1-py33_0 3', 'python-3.3.2-0 3', 'readline-6.2-0 3', 'sqlite-3.7.13-0 3', 'tk-8.5.13-0 3', 'zlib-1.2.7-0 3']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following NEW packages will be INSTALLED:
 
     cython:   0.19.1-py33_0 my_channel (copy)
@@ -695,14 +733,14 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3',
-        'dateutil-2.1-py33_1 3'], 'UNLINK':  ['cython-0.19-py33_0',
-            'dateutil-1.5-py33_0']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19.1-py33_0 3',
+            'dateutil-2.1-py33_1 3'], 'UNLINK':  ['cython-0.19-py33_0',
+                'dateutil-1.5-py33_0']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be UPDATED:
 
     cython:   0.19-py33_0 <unknown>  --> 0.19.1-py33_0 my_channel (copy)
@@ -710,14 +748,14 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 3',
-        'dateutil-1.5-py33_0 3'], 'UNLINK':  ['cython-0.19.1-py33_0',
-            'dateutil-2.1-py33_1']})
+        actions = defaultdict(list, {'LINK': ['cython-0.19-py33_0 3',
+            'dateutil-1.5-py33_0 3'], 'UNLINK':  ['cython-0.19.1-py33_0',
+                'dateutil-2.1-py33_1']})
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 The following packages will be DOWNGRADED:
 
     cython:   0.19.1-py33_0 my_channel --> 0.19-py33_0 <unknown>  (copy)
@@ -727,15 +765,20 @@ The following packages will be DOWNGRADED:
 
 
 def test_display_actions_features():
-    os.environ['CONDA_SHOW_CHANNEL_URLS'] = 'False'
-    reset_context(())
+    with env_var('CONDA_SHOW_CHANNEL_URLS', 'False', stack_callback=conda_tests_ctxt_mgmt_def_pol):
 
-    actions = defaultdict(list, {'LINK': ['channel-1::numpy-1.7.1-py33_p0', 'channel-1::cython-0.19-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -746,12 +789,18 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions = defaultdict(list, {'UNLINK': ['channel-1::numpy-1.7.1-py33_p0', 'channel-1::cython-0.19-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -762,12 +811,20 @@ The following packages will be REMOVED:
 
 """
 
-    actions = defaultdict(list, {'UNLINK': ['channel-1::numpy-1.7.1-py33_p0'], 'LINK': ['channel-1::numpy-1.7.0-py33_p0']})
+        actions = defaultdict(list)
+        actions.update({
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.0=py33_p0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -777,12 +834,20 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::numpy-1.7.1-py33_p0'], 'UNLINK': ['channel-1::numpy-1.7.0-py33_p0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.0=py33_p0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -792,13 +857,21 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::numpy-1.7.1-py33_p0'], 'UNLINK': ['channel-1::numpy-1.7.1-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    # NB: Packages whose version do not changed are put in UPDATED
-    assert c.stdout == """
+        # NB: Packages whose version do not changed are put in UPDATED
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -808,12 +881,20 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'UNLINK': ['channel-1::numpy-1.7.1-py33_p0'], 'LINK': ['channel-1::numpy-1.7.1-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -822,15 +903,20 @@ The following packages will be UPDATED:
     numpy: 1.7.1-py33_p0 [mkl] --> 1.7.1-py33_0
 
 """
-    os.environ['CONDA_SHOW_CHANNEL_URLS'] = 'True'
-    reset_context(())
+    with env_var('CONDA_SHOW_CHANNEL_URLS', 'True', stack_callback=conda_tests_ctxt_mgmt_def_pol):
 
-    actions = defaultdict(list, {'LINK': ['channel-1::numpy-1.7.1-py33_p0', 'channel-1::cython-0.19-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -841,12 +927,18 @@ The following NEW packages will be INSTALLED:
 
 """
 
-    actions = defaultdict(list, {'UNLINK': ['channel-1::numpy-1.7.1-py33_p0', 'channel-1::cython-0.19-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+                get_matchspec_from_index(index, 'channel-1::cython==0.19=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -857,12 +949,20 @@ The following packages will be REMOVED:
 
 """
 
-    actions = defaultdict(list, {'UNLINK': ['channel-1::numpy-1.7.1-py33_p0'], 'LINK': ['channel-1::numpy-1.7.0-py33_p0']})
+        actions = defaultdict(list)
+        actions.update({
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.0=py33_p0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -872,12 +972,20 @@ The following packages will be DOWNGRADED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::numpy-1.7.1-py33_p0'], 'UNLINK': ['channel-1::numpy-1.7.0-py33_p0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.0=py33_p0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -887,13 +995,21 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'LINK': ['channel-1::numpy-1.7.1-py33_p0'], 'UNLINK': ['channel-1::numpy-1.7.1-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    # NB: Packages whose version do not changed are put in UPDATED
-    assert c.stdout == """
+        # NB: Packages whose version do not changed are put in UPDATED
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -903,12 +1019,20 @@ The following packages will be UPDATED:
 
 """
 
-    actions = defaultdict(list, {'UNLINK': ['channel-1::numpy-1.7.1-py33_p0'], 'LINK': ['channel-1::numpy-1.7.1-py33_0']})
+        actions = defaultdict(list)
+        actions.update({
+            'UNLINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_p0'),
+            ],
+            'LINK': [
+                get_matchspec_from_index(index, 'channel-1::numpy==1.7.1=py33_0'),
+            ]
+        })
 
-    with captured() as c:
-        display_actions(actions, index)
+        with captured() as c:
+            display_actions(actions, index)
 
-    assert c.stdout == """
+        assert c.stdout == """
 ## Package Plan ##
 
 
@@ -923,13 +1047,13 @@ class TestDeprecatedExecutePlan(unittest.TestCase):
 
     def test_update_old_plan(self):
         old_plan = ['# plan', 'INSTRUCTION arg']
-        new_plan = plan.update_old_plan(old_plan)
+        new_plan = update_old_plan(old_plan)
 
         expected = [('INSTRUCTION', 'arg')]
         self.assertEqual(new_plan, expected)
 
         with self.assertRaises(CondaError):
-            plan.update_old_plan(['INVALID'])
+            update_old_plan(['INVALID'])
 
     def test_execute_plan(self):
         initial_commands = inst.commands
@@ -946,7 +1070,7 @@ class TestDeprecatedExecutePlan(unittest.TestCase):
 
         old_plan = ['# plan', 'INSTRUCTION arg']
 
-        plan.execute_plan(old_plan)
+        execute_plan(old_plan)
 
         self.assertTrue(INSTRUCTION_CMD.called)
         self.assertEqual(INSTRUCTION_CMD.arg, 'arg')
@@ -1101,8 +1225,8 @@ def generate_mocked_context(prefix, root_prefix, envs_dirs):
 #
 #     def test_determine_dists_per_prefix_2(self):  # not_requires
 #         root_prefix = self.root_prefix
-#         with env_var("CONDA_ROOT_PREFIX", root_prefix, reset_context):
-#             with env_var("CONDA_ENVS_DIRS", join(root_prefix, 'envs'), reset_context):
+#         with env_var("CONDA_ROOT_PREFIX", root_prefix, stack_callback=conda_tests_ctxt_mgmt_def_pol):
+#             with env_var("CONDA_ENVS_DIRS", join(root_prefix, 'envs'), stack_callback=conda_tests_ctxt_mgmt_def_pol):
 #                 with patch.object(plan, "get_resolve_object") as gen_resolve_object_mock:
 #                     gen_resolve_object_mock.return_value = self.res
 #                     preferred_envs_with_specs = {None: ['test-spec', 'test-spec2'], 'ranenv': ['test']}
@@ -1263,8 +1387,8 @@ def generate_remove_action(prefix, unlink):
 #         with tempdir() as root_prefix:
 #             mkdir_p(join(root_prefix, 'conda-meta'))
 #             touch(join(root_prefix, 'conda-meta', 'history'))
-#             with env_var("CONDA_ROOT_PREFIX", root_prefix, reset_context):
-#                 with env_var("CONDA_ENVS_DIRS", join(root_prefix, 'envs'), reset_context):
+#             with env_var("CONDA_ROOT_PREFIX", root_prefix, stack_callback=conda_tests_ctxt_mgmt_def_pol):
+#                 with env_var("CONDA_ENVS_DIRS", join(root_prefix, 'envs'), stack_callback=conda_tests_ctxt_mgmt_def_pol):
 #                     with patch("conda.plan.remove_actions",
 #                                return_value=generate_remove_action(root_prefix, [Dist("test1-2.1.4-1")])):
 #                         preferred_env_prefix = join(root_prefix, 'envs', '_env_')
@@ -1319,8 +1443,8 @@ def generate_remove_action(prefix, unlink):
 #         with tempdir() as root_prefix:
 #             mkdir_p(join(root_prefix, 'conda-meta'))
 #             touch(join(root_prefix, 'conda-meta', 'history'))
-#             with env_var("CONDA_ROOT_PREFIX", root_prefix, reset_context):
-#                 with env_var("CONDA_ENVS_DIRS", join(root_prefix, 'envs'), reset_context):
+#             with env_var("CONDA_ROOT_PREFIX", root_prefix, stack_callback=conda_tests_ctxt_mgmt_def_pol):
+#                 with env_var("CONDA_ENVS_DIRS", join(root_prefix, 'envs'), stack_callback=conda_tests_ctxt_mgmt_def_pol):
 #                     env_path = join(root_prefix, 'envs', '_env_')
 #                     ed = EnvsDirectory(join(root_prefix, 'envs'))
 #                     ed.add_preferred_env_package('_env_', 'test3', join(env_path, "conda-meta", "test3-1.2.0.json"), "test3")
@@ -1342,7 +1466,7 @@ def test_pinned_specs():
     # Test pinned specs environment variable
     specs_str_1 = ("numpy 1.11", "python >3")
     specs_1 = tuple(MatchSpec(spec_str, optional=True) for spec_str in specs_str_1)
-    with env_var('CONDA_PINNED_PACKAGES', '&'.join(specs_str_1), reset_context):
+    with env_var('CONDA_PINNED_PACKAGES', '&'.join(specs_str_1), stack_callback=conda_tests_ctxt_mgmt_def_pol):
         pinned_specs = get_pinned_specs("/none")
         assert pinned_specs == specs_1
         assert pinned_specs != specs_str_1
@@ -1363,13 +1487,15 @@ def test_pinned_specs():
     # Test pinned specs conda configuration and pinned specs conda environment file
     with tempdir() as td:
         mkdir_p(join(td, 'conda-meta'))
-        with open(join(td, 'conda-meta', 'pinned'), 'w') as fh:
+        pinned_filename = join(td, 'conda-meta', 'pinned')
+        with open(pinned_filename, 'w') as fh:
             fh.write("\n".join(specs_str_1))
             fh.write("\n")
 
-        with env_var('CONDA_PREFIX', td, reset_context):
-            run_command(Commands.CONFIG, "--env --add pinned_packages requests=2.13")
-            with env_var('CONDA_PINNED_PACKAGES', '&'.join(specs_str_2), reset_context):
+        with env_var('CONDA_PREFIX', td, stack_callback=conda_tests_ctxt_mgmt_def_pol):
+            run_command(Commands.CONFIG, "--env", "--add", "pinned_packages", "requests=2.13")
+            condarc = join(td, '.condarc')
+            with env_var('CONDA_PINNED_PACKAGES', '&'.join(specs_str_2), partial(stack_context, True, search_path=(condarc,))):#conda_tests_ctxt_mgmt_def_pol):
                 pinned_specs = get_pinned_specs(td)
                 expected = specs_2 + (MatchSpec("requests 2.13.*", optional=True),) + specs_1
                 assert pinned_specs == expected

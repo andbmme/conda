@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from logging import getLogger
-from threading import Lock, local
+from threading import local
 
 from . import (AuthBase, BaseAdapter, HTTPAdapter, Session, _basic_auth_str,
-               extract_cookies_to_jar, get_auth_from_url, get_netrc_auth)
+               extract_cookies_to_jar, get_auth_from_url, get_netrc_auth, Retry)
 from .adapters.ftp import FTPAdapter
 from .adapters.localfs import LocalFSAdapter
 from .adapters.s3 import S3Adapter
@@ -21,6 +23,14 @@ from ...exceptions import ProxyError
 log = getLogger(__name__)
 RETRIES = 3
 
+
+CONDA_SESSION_SCHEMES = frozenset((
+    "http",
+    "https",
+    "ftp",
+    "s3",
+    "file",
+))
 
 class EnforceUnusedAdapter(BaseAdapter):
 
@@ -61,9 +71,7 @@ class CondaSession(Session):
 
         self.auth = CondaHttpAuth()  # TODO: should this just be for certain protocol adapters?
 
-        proxies = context.proxy_servers
-        if proxies:
-            self.proxies = proxies
+        self.proxies.update(context.proxy_servers)
 
         if context.offline:
             unused_adapter = EnforceUnusedAdapter()
@@ -74,7 +82,9 @@ class CondaSession(Session):
 
         else:
             # Configure retries
-            http_adapter = HTTPAdapter(max_retries=context.remote_max_retries)
+            retry = Retry(total=context.remote_max_retries,
+                          backoff_factor=context.remote_backoff_factor)
+            http_adapter = HTTPAdapter(max_retries=retry)
             self.mount("http://", http_adapter)
             self.mount("https://", http_adapter)
             self.mount("ftp://", FTPAdapter())
@@ -90,27 +100,6 @@ class CondaSession(Session):
             self.cert = (context.client_ssl_cert, context.client_ssl_cert_key)
         elif context.client_ssl_cert:
             self.cert = context.client_ssl_cert
-
-
-class SingleThreadCondaSession(CondaSession):
-    # according to http://stackoverflow.com/questions/18188044/is-the-session-object-from-pythons-requests-library-thread-safe  # NOQA
-    # request's Session isn't thread-safe for us
-
-    _session = None
-    _mutex = Lock()
-
-    def __init__(self):
-        super(SingleThreadCondaSession, self).__init__()
-
-    def __enter__(self):
-        session = SingleThreadCondaSession._session
-        if session is None:
-            session = SingleThreadCondaSession._session = self
-        SingleThreadCondaSession._mutex.acquire()
-        return session
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        SingleThreadCondaSession._mutex.release()
 
 
 class CondaHttpAuth(AuthBase):
@@ -151,7 +140,7 @@ class CondaHttpAuth(AuthBase):
         return url
 
     @staticmethod
-    def handle_407(response, **kwargs):
+    def handle_407(response, **kwargs):  # pragma: no cover
         """
         Prompts the user for the proxy username and password and modifies the
         proxy in the session object to include it.

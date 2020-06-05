@@ -1,41 +1,126 @@
 # -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import codecs
 from getpass import getpass
-from logging import getLogger
 from os.path import abspath, expanduser
 import re
 import socket
 
-from .path import split_filename
+from .compat import input, on_win
+from .path import split_filename, strip_pkg_extension
 from .._vendor.auxlib.decorators import memoize
 from .._vendor.urllib3.exceptions import LocationParseError
 from .._vendor.urllib3.util.url import Url, parse_url
-from ..common.compat import on_win
 
 try:  # pragma: py2 no cover
     # Python 3
-    from urllib.parse import (quote, quote_plus, unquote, unquote_plus,  # NOQA
-                              urlunparse as stdlib_urlparse, urljoin)  # NOQA
-    from urllib.request import pathname2url  # NOQA
+    from urllib.parse import (quote, quote_plus, unquote, unquote_plus)
 except ImportError:  # pragma: py3 no cover
     # Python 2
-    from urllib import quote, quote_plus, unquote, unquote_plus, pathname2url  # NOQA
-    from urlparse import urlunparse as stdlib_urlparse, urljoin  # NOQA
+    from urllib import (quote, quote_plus, unquote, unquote_plus)  # NOQA
 
 
-log = getLogger(__name__)
+def hex_octal_to_int(ho):
+    ho = ord(ho)
+    o0 = ord('0')
+    o9 = ord('9')
+    oA = ord('A')
+    oF = ord('F')
+    res = ho - o0 if ho >= o0 and ho <= o9 else (ho - oA + 10) if ho >= oA and ho <= oF else None
+    return res
+
+
+@memoize
+def percent_decode(path):
+
+    # This is not fast so avoid when we can.
+    if '%' not in path:
+        return path
+    ranges = []
+    for m in re.finditer(r'(%[0-9A-F]{2})', path):
+        ranges.append((m.start(), m.end()))
+    if not len(ranges):
+        return path
+
+    # Sorry! Correctness is more important than speed at the moment.
+    # Should use a map + lambda eventually.
+    result = b''
+    skips = 0
+    for i, c in enumerate(path):
+        if skips > 0:
+            skips -= 1
+            continue
+        c = c.encode('ascii')
+        emit = c
+        if c == b'%':
+            for r in ranges:
+                if i == r[0]:
+                    import struct
+                    emit = struct.pack(
+                        "B", hex_octal_to_int(path[i+1])*16 + hex_octal_to_int(path[i+2]))
+                    skips = 2
+                    break
+        if emit:
+            result += emit
+    return codecs.utf_8_decode(result)[0]
+
+
+file_scheme = 'file://'
+
+# Keeping this around for now, need to combine with the same function in conda/common/path.py
+"""
+def url_to_path(url):
+    assert url.startswith(file_scheme), "{} is not a file-scheme URL".format(url)
+    decoded = percent_decode(url[len(file_scheme):])
+    if decoded.startswith('/') and decoded[2] == ':':
+        # A Windows path.
+        decoded.replace('/', '\\')
+    return decoded
+"""
 
 
 @memoize
 def path_to_url(path):
     if not path:
         raise ValueError('Not allowed: %r' % path)
-    if path.startswith('file:/'):
+    if path.startswith(file_scheme):
+        try:
+            path.decode('ascii')
+        except UnicodeDecodeError:
+            raise ValueError('Non-ascii not allowed for things claiming to be URLs: %r' % path)
         return path
-    path = abspath(expanduser(path))
-    url = urljoin('file:', pathname2url(path))
-    return url
+    path = abspath(expanduser(path)).replace('\\', '/')
+    # We do not use urljoin here because we want to take our own
+    # *very* explicit control of how paths get encoded into URLs.
+    #   We should not follow any RFCs on how to encode and decode
+    # them, we just need to make sure we can represent them in a
+    # way that will not cause problems for whatever amount of
+    # urllib processing we *do* need to do on them (which should
+    # be none anyway, but I doubt that is the case). I have gone
+    # for ASCII and % encoding of everything not alphanumeric or
+    # not in `!'()*-._/:`. This should be pretty save.
+    #
+    # To avoid risking breaking the internet, this code only runs
+    # for `file://` URLs.
+    #
+    percent_encode_chars = "!'()*-._/\\:"
+    percent_encode = lambda s: "".join(["%%%02X" % ord(c), c]
+                                       [c < "{" and c.isalnum() or c in percent_encode_chars]
+                                       for c in s)
+    if any(ord(char) >= 128 for char in path):
+        path = percent_encode(path.decode('unicode-escape')
+                              if hasattr(path, 'decode')
+                              else bytes(path, "utf-8").decode('unicode-escape'))
+
+    # https://blogs.msdn.microsoft.com/ie/2006/12/06/file-uris-in-windows/
+    if len(path) > 1 and path[1] == ':':
+        path = file_scheme + '/' + path
+    else:
+        path = file_scheme + path
+    return path
 
 
 @memoize
@@ -117,7 +202,8 @@ def is_ipv6_address_win_py27(string_ip):
         [False, False]
     """
     # python 2.7 on windows does not have socket.inet_pton
-    return bool(re.match(r"^(((?=.*(::))(?!.*\3.+\3))\3?|[\dA-F]{1,4}:)"
+    return bool(re.match(r""  # lgtm [py/regex/unmatchable-dollar]
+                         r"^(((?=.*(::))(?!.*\3.+\3))\3?|[\dA-F]{1,4}:)"
                          r"([\dA-F]{1,4}(\3|:\b)|\2){5}"
                          r"(([\dA-F]{1,4}(\3|:\b|$)|\2){2}|"
                          r"(((2[0-4]|1\d|[1-9])?\d|25[0-5])\.?\b){4})\Z",
@@ -188,20 +274,25 @@ def split_anaconda_token(url):
     return cleaned_url.rstrip('/'), token
 
 
-def split_platform(url, known_subdirs):
+def split_platform(known_subdirs, url):
     """
 
     Examples:
-        >>> from conda.base.constants import PLATFORM_DIRECTORIES
-        >>> split_platform("https://1.2.3.4/t/tk-123/osx-64/path", PLATFORM_DIRECTORIES)
-        (u'https://1.2.3.4/t/tk-123/path', u'osx-64')
+        >>> from conda.base.constants import KNOWN_SUBDIRS
+        >>> split_platform(KNOWN_SUBDIRS, "https://1.2.3.4/t/tk-123/linux-ppc64le/path")
+        (u'https://1.2.3.4/t/tk-123/path', u'linux-ppc64le')
 
     """
-    _platform_match_regex = r'/(%s)/?' % r'|'.join(r'%s' % d for d in known_subdirs)
-    _platform_match = re.search(_platform_match_regex, url, re.IGNORECASE)
+    _platform_match = _split_platform_re(known_subdirs).search(url)
     platform = _platform_match.groups()[0] if _platform_match else None
     cleaned_url = url.replace('/' + platform, '', 1) if platform is not None else url
     return cleaned_url.rstrip('/'), platform
+
+
+@memoize
+def _split_platform_re(known_subdirs):
+    _platform_match_regex = r'/(%s)(?:/|$)' % r'|'.join(r'%s' % d for d in known_subdirs)
+    return re.compile(_platform_match_regex, re.IGNORECASE)
 
 
 def has_platform(url, known_subdirs):
@@ -210,12 +301,6 @@ def has_platform(url, known_subdirs):
         return None
     maybe_a_platform = url_no_package_name.rsplit('/', 1)[-1]
     return maybe_a_platform in known_subdirs and maybe_a_platform or None
-
-
-def _split_package_filename(url):
-    cleaned_url, package_filename = (url.rsplit('/', 1) if url.endswith(('.tar.bz2', '.json'))
-                                     else (url, None))
-    return cleaned_url, package_filename
 
 
 def split_scheme_auth_token(url):
@@ -235,11 +320,12 @@ def split_scheme_auth_token(url):
     return remainder_url, url_parts.scheme, url_parts.auth, token
 
 
-def split_conda_url_easy_parts(url, known_subdirs):
+def split_conda_url_easy_parts(known_subdirs, url):
     # scheme, auth, token, platform, package_filename, host, port, path, query
     cleaned_url, token = split_anaconda_token(url)
-    cleaned_url, platform = split_platform(cleaned_url, known_subdirs)
-    cleaned_url, package_filename = _split_package_filename(cleaned_url)
+    cleaned_url, platform = split_platform(known_subdirs, cleaned_url)
+    _, ext = strip_pkg_extension(cleaned_url)
+    cleaned_url, package_filename = cleaned_url.rsplit('/', 1) if ext else (cleaned_url, None)
 
     # TODO: split out namespace using regex
 
@@ -284,7 +370,14 @@ def maybe_add_auth(url, auth, force=False):
 
 
 def maybe_unquote(url):
-    return unquote_plus(url) if url else url
+    return unquote_plus(remove_auth(url)) if url else url
+
+
+def remove_auth(url):
+    url_parts = parse_url(url)._asdict()
+    if url_parts['auth']:
+        del url_parts['auth']
+    return Url(**url_parts).url
 
 
 if __name__ == "__main__":

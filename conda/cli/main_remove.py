@@ -1,32 +1,29 @@
-# conda is distributed under the terms of the BSD 3-clause license.
-# Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
-
+# -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import absolute_import, division, print_function, unicode_literals
 
-from collections import defaultdict
 import logging
-from os.path import isdir
 import sys
 
-from .common import check_non_admin, confirm_yn, specs_from_args, stdout_json
+from .common import check_non_admin, specs_from_args
 from .install import handle_txn
 from ..base.context import context
-from ..common.compat import iteritems, iterkeys
-from ..core.envs_manager import EnvsDirectory
-from ..core.linked_data import linked_data
+from ..core.envs_manager import unregister_env
+from ..core.link import PrefixSetup, UnlinkLinkTransaction
+from ..core.prefix_data import PrefixData
 from ..core.solve import Solver
 from ..exceptions import CondaEnvironmentError, CondaValueError
-from ..gateways.disk.delete import delete_trash, rm_rf
-from ..instructions import PREFIX
-from ..plan import (add_unlink)
-from ..resolve import MatchSpec
+from ..gateways.disk.delete import rm_rf, path_is_clean
+from ..models.match_spec import MatchSpec
+from ..exceptions import PackagesNotFoundError
 
 log = logging.getLogger(__name__)
 
 
 def execute(args, parser):
 
-    if not (args.all or args.package_names or args.features):
+    if not (args.all or args.package_names):
         raise CondaValueError('no package names supplied,\n'
                               '       try "conda remove -h" for more details')
 
@@ -36,55 +33,58 @@ def execute(args, parser):
     if args.all and prefix == context.default_prefix:
         msg = "cannot remove current environment. deactivate and run conda remove again"
         raise CondaEnvironmentError(msg)
-    if args.all and not isdir(prefix):
+
+    if args.all and path_is_clean(prefix):
         # full environment removal was requested, but environment doesn't exist anyway
+
+        # .. but you know what? If you call `conda remove --all` you'd expect the dir
+        # not to exist afterwards, would you not? If not (fine, I can see the argument
+        # about deleting people's work in envs being a very bad thing indeed), but if
+        # being careful is the goal it would still be nice if after `conda remove --all`
+        # to be able to do `conda create` on the same environment name.
+        #
+        # try:
+        #     rm_rf(prefix, clean_empty_parents=True)
+        # except:
+        #     log.warning("Failed rm_rf() of partially existent env {}".format(prefix))
+
         return 0
 
-    if not EnvsDirectory.is_conda_environment(prefix):
-        from ..exceptions import EnvironmentLocationNotFound
-        raise EnvironmentLocationNotFound(prefix)
-
-    delete_trash()
     if args.all:
         if prefix == context.root_prefix:
             raise CondaEnvironmentError('cannot remove root environment,\n'
                                         '       add -n NAME or -p PREFIX option')
         print("\nRemove all packages in environment %s:\n" % prefix, file=sys.stderr)
 
-        index = linked_data(prefix)
-        index = {dist: info for dist, info in iteritems(index)}
+        if 'package_names' in args:
+            stp = PrefixSetup(
+                target_prefix=prefix,
+                unlink_precs=tuple(PrefixData(prefix).iter_records()),
+                link_precs=(),
+                remove_specs=(),
+                update_specs=(),
+                neutered_specs={},
+            )
+            txn = UnlinkLinkTransaction(stp)
+            try:
+                handle_txn(txn, prefix, args, False, True)
+            except PackagesNotFoundError:
+                print("No packages found in %s. Continuing environment removal" % prefix)
+        rm_rf(prefix, clean_empty_parents=True)
+        unregister_env(prefix)
 
-        actions = defaultdict(list)
-        actions[PREFIX] = prefix
-        for dist in sorted(iterkeys(index)):
-            add_unlink(actions, dist)
-        actions['ACTION'] = 'REMOVE_ALL'
-        action_groups = (actions, index),
-
-        if not context.json:
-            confirm_yn()
-        rm_rf(prefix)
-
-        if context.json:
-            stdout_json({
-                'success': True,
-                'actions': tuple(x[0] for x in action_groups)
-            })
         return
 
     else:
         if args.features:
             specs = tuple(MatchSpec(track_features=f) for f in set(args.package_names))
-            channel_urls = context.channels
-            subdirs = context.subdirs
         else:
             specs = specs_from_args(args.package_names)
-            channel_urls = ()
-            subdirs = ()
+        channel_urls = ()
+        subdirs = ()
         solver = Solver(prefix, channel_urls, subdirs, specs_to_remove=specs)
-        txn = solver.solve_for_transaction(force_remove=args.force)
-        pfe = txn.get_pfe()
-        handle_txn(pfe, txn, prefix, args, False, True)
+        txn = solver.solve_for_transaction()
+        handle_txn(txn, prefix, args, False, True)
 
     # Keep this code for dev reference until private envs can be re-enabled in
     # Solver.solve_for_transaction

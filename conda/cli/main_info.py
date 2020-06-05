@@ -1,28 +1,22 @@
-# (c) 2012-2013 Continuum Analytics, Inc. / http://continuum.io
-# All Rights Reserved
-#
-# conda is distributed under the terms of the BSD 3-clause license.
-# Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
-
+# -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from collections import OrderedDict
 import json
 from logging import getLogger
 import os
-from os import listdir
 from os.path import exists, expanduser, isfile, join
 import re
 import sys
-from textwrap import dedent
 
-from .common import handle_envs_list, stdout_json
+from .common import print_envs_list, stdout_json
 from .. import CONDA_PACKAGE_ROOT, __version__ as conda_version
-from ..base.context import conda_in_private_env, context, sys_rc_path, user_rc_path
+from ..base.context import conda_in_private_env, context, env_name, sys_rc_path, user_rc_path
 from ..common.compat import iteritems, itervalues, on_win, text_type
 from ..common.url import mask_anaconda_token
-from ..core.envs_manager import EnvsDirectory
-from ..core.repodata import query_all
+from ..core.index import _supplement_index_with_system
 from ..models.channel import all_channel_urls, offline_keep
 from ..models.match_spec import MatchSpec
 from ..utils import human_bytes
@@ -35,8 +29,8 @@ def get_user_site():  # pragma: no cover
     try:
         if not on_win:
             if exists(expanduser('~/.local/lib')):
-                python_re = re.compile('python\d\.\d')
-                for path in listdir(expanduser('~/.local/lib/')):
+                python_re = re.compile(r'python\d\.\d')
+                for path in os.listdir(expanduser('~/.local/lib/')):
                     if python_re.match(path):
                         site_dirs.append("~/.local/lib/%s" % path)
         else:
@@ -45,7 +39,7 @@ def get_user_site():  # pragma: no cover
             APPDATA = os.environ[str('APPDATA')]
             if exists(join(APPDATA, 'Python')):
                 site_dirs = [join(APPDATA, 'Python', i) for i in
-                             listdir(join(APPDATA, 'PYTHON'))]
+                             os.listdir(join(APPDATA, 'PYTHON'))]
     except (IOError, OSError) as e:
         log.debug('Error accessing user site directory.\n%r', e)
     return site_dirs
@@ -76,7 +70,7 @@ def pretty_package(prec):
     for key in sorted(set(pkg.keys()) - SKIP_FIELDS):
         d[key] = pkg[key]
 
-    print()
+    print('')
     header = "%s %s %s" % (d['name'], d['version'], d['build string'])
     print(header)
     print('-'*len(header))
@@ -88,11 +82,11 @@ def pretty_package(prec):
 
 
 def print_package_info(packages):
-
+    from ..core.subdir_data import SubdirData
     results = {}
     for package in packages:
         spec = MatchSpec(package)
-        results[package] = tuple(query_all(context.channels, context.subdirs, spec))
+        results[package] = tuple(SubdirData.query_all(spec))
 
     if context.json:
         stdout_json({package: results[package] for package in packages})
@@ -101,14 +95,12 @@ def print_package_info(packages):
             for prec in result:
                 pretty_package(prec)
 
+    print("WARNING: 'conda info package_name' is deprecated.\n"
+          "          Use 'conda search package_name --info'.",
+          file=sys.stderr)
+
 
 def get_info_dict(system=False):
-    try:
-        from ..install import linked_data
-        root_pkgs = linked_data(context.root_prefix)
-    except:  # pragma: no cover
-        root_pkgs = {}
-
     try:
         from requests import __version__ as requests_version
         # These environment variables can influence requests' behavior, along with configuration
@@ -126,12 +118,8 @@ def get_info_dict(system=False):
 
     try:
         from conda_env import __version__ as conda_env_version
-    except:  # pragma: no cover
-        try:
-            cenv = [p for p in itervalues(root_pkgs) if p['name'] == 'conda-env']
-            conda_env_version = cenv[0]['version']
-        except:
-            conda_env_version = "not installed"
+    except Exception:  # pragma: no cover
+        conda_env_version = "not installed"
 
     try:
         import conda_build
@@ -141,6 +129,10 @@ def get_info_dict(system=False):
         conda_build_version = "Error %s" % e
     else:  # pragma: no cover
         conda_build_version = conda_build.__version__
+
+    virtual_pkg_index = {}
+    _supplement_index_with_system(virtual_pkg_index)
+    virtual_pkgs = [[p.name, p.version] for p in virtual_pkg_index.values()]
 
     channels = list(all_channel_urls(context.channels))
     if not context.json:
@@ -157,7 +149,7 @@ def get_info_dict(system=False):
         if isfile(user_netrc):
             netrc_file = user_netrc
 
-    active_prefix_name = EnvsDirectory.env_name(context.active_prefix)
+    active_prefix_name = env_name(context.active_prefix)
 
     info_dict = dict(
         platform=context.subdir,
@@ -187,48 +179,64 @@ def get_info_dict(system=False):
         conda_location=CONDA_PACKAGE_ROOT,
         config_files=config_files,
         netrc_file=netrc_file,
+        virtual_pkgs=virtual_pkgs,
     )
     if on_win:
-        from ..common.platform import is_admin_on_windows
+        from ..common._os.windows import is_admin_on_windows
         info_dict['is_windows_admin'] = is_admin_on_windows()
     else:
         info_dict['UID'] = os.geteuid()
         info_dict['GID'] = os.getegid()
 
-    if system:
-        evars = {
-            'CIO_TEST',
-            'CONDA_DEFAULT_ENV',
-            'CONDA_ENVS_PATH',
-            'DYLD_LIBRARY_PATH',
-            'FTP_PROXY',
-            'HTTP_PROXY',
-            'HTTPS_PROXY',
-            'LD_LIBRARY_PATH',
-            'PATH',
-            'PYTHONHOME',
-            'PYTHONPATH',
-            'REQUESTS_CA_BUNDLE',
-            'SSL_CERT_FILE',
-        }
+    env_var_keys = {
+        'CIO_TEST',
+        'REQUESTS_CA_BUNDLE',
+        'SSL_CERT_FILE',
+    }
 
-        evars.update(v for v in os.environ if v.startswith('CONDA_'))
-        evars.update(v for v in os.environ if v.startswith('conda_'))
+    # add all relevant env vars, e.g. startswith('CONDA') or endswith('PATH')
+    env_var_keys.update(v for v in os.environ if v.upper().startswith('CONDA'))
+    env_var_keys.update(v for v in os.environ if v.upper().startswith('PYTHON'))
+    env_var_keys.update(v for v in os.environ if v.upper().endswith('PATH'))
+    env_var_keys.update(v for v in os.environ if v.upper().startswith('SUDO'))
 
-        info_dict.update({
-            'sys.version': sys.version,
-            'sys.prefix': sys.prefix,
-            'sys.executable': sys.executable,
-            'site_dirs': get_user_site(),
-            'env_vars': {ev: os.getenv(ev, os.getenv(ev.lower(), '<not set>')) for ev in evars},
-        })
+    env_vars = {ev: os.getenv(ev, os.getenv(ev.lower(), '<not set>')) for ev in env_var_keys}
+
+    proxy_keys = (v for v in os.environ if v.upper().endswith('PROXY'))
+    env_vars.update({ev: '<set>' for ev in proxy_keys})
+
+    info_dict.update({
+        'sys.version': sys.version,
+        'sys.prefix': sys.prefix,
+        'sys.executable': sys.executable,
+        'site_dirs': get_user_site(),
+        'env_vars': env_vars,
+    })
 
     return info_dict
+
+
+def get_env_vars_str(info_dict):
+    from textwrap import wrap
+    builder = []
+    builder.append("%23s:" % "environment variables")
+    env_vars = info_dict.get('env_vars', {})
+    for key in sorted(env_vars):
+        value = wrap(env_vars[key])
+        first_line = value[0] if len(value) else ""
+        other_lines = value[1:] if len(value) > 1 else ()
+        builder.append("%25s=%s" % (key, first_line))
+        for val in other_lines:
+            builder.append(' ' * 26 + val)
+    return '\n'.join(builder)
 
 
 def get_main_info_str(info_dict):
     for key in 'pkgs_dirs', 'envs_dirs', 'channels', 'config_files':
         info_dict['_' + key] = ('\n' + 26 * ' ').join(info_dict[key])
+
+    info_dict['_virtual_pkgs'] = ('\n' + 26 * ' ').join([
+        '%s=%s' % tuple(x) for x in info_dict['virtual_pkgs']])
     info_dict['_rtwro'] = ('writable' if info_dict['root_writable'] else 'read only')
 
     format_param = lambda nm, val: "%23s : %s" % (nm, val)
@@ -250,6 +258,7 @@ def get_main_info_str(info_dict):
         format_param('conda version', info_dict['conda_version']),
         format_param('conda-build version', info_dict['conda_build_version']),
         format_param('python version', info_dict['python_version']),
+        format_param('virtual packages', info_dict['_virtual_pkgs']),
         format_param('base environment', '%s  (%s)' % (info_dict['root_prefix'],
                                                        info_dict['_rtwro'])),
         format_param('channel URLs', info_dict['_channels']),
@@ -274,11 +283,11 @@ def get_main_info_str(info_dict):
 
 
 def execute(args, parser):
-    if args.root:
+    if args.base:
         if context.json:
             stdout_json({'root_prefix': context.root_prefix})
         else:
-            print(context.root_prefix)
+            print('{}'.format(context.root_prefix))
         return
 
     if args.packages:
@@ -297,7 +306,7 @@ def execute(args, parser):
             print(json.dumps({"channels": context.channels}))
         return 0
 
-    options = 'envs', 'system', 'license'
+    options = 'envs', 'system'
 
     if args.all or context.json:
         for option in options:
@@ -305,10 +314,14 @@ def execute(args, parser):
     info_dict = get_info_dict(args.system)
 
     if (args.all or all(not getattr(args, opt) for opt in options)) and not context.json:
-        print(get_main_info_str(info_dict))
+        stdout_logger = getLogger("conda.stdoutlog")
+        stdout_logger.info(get_main_info_str(info_dict))
+        stdout_logger.info("\n")
 
     if args.envs:
-        handle_envs_list(info_dict['envs'], not context.json)
+        from ..core.envs_manager import list_all_known_prefixes
+        info_dict['envs'] = list_all_known_prefixes()
+        print_envs_list(info_dict['envs'], not context.json)
 
     if args.system:
         if not context.json:
@@ -324,26 +337,14 @@ def execute(args, parser):
             if site_dirs:
                 print(site_dirs[0])
             else:
-                print()
+                print('')
             for site_dir in site_dirs[1:]:
                 print('                %s' % site_dir)
-            print()
+            print('')
 
             for name, value in sorted(iteritems(info_dict['env_vars'])):
                 print("%s: %s" % (name, value))
-            print()
-
-    if args.license and not context.json:
-        try:
-            from _license import show_info
-            show_info()  # pragma: no cover
-        except ImportError:
-            print(dedent("""
-                WARNING: could not import _license.show_info
-                # try:
-                # $ conda install -n root _license"""))
-        except Exception as e:  # pragma: no cover
-            log.warn('%r', e)
+            print('')
 
     if context.json:
         stdout_json(info_dict)

@@ -1,9 +1,31 @@
 from collections import OrderedDict
 import os
+from os.path import join
 import random
 import unittest
+from uuid import uuid4
 
+from conda.core.prefix_data import PrefixData
+from conda.base.context import conda_tests_ctxt_mgmt_def_pol
+from conda.exceptions import CondaHTTPError
+from conda.models.match_spec import MatchSpec
+from conda.common.io import env_vars
 from conda.common.serialize import yaml_load
+from conda.install import on_win
+
+from . import support_file
+from .utils import make_temp_envs_dir, Commands, run_command
+from tests.test_utils import is_prefix_activated_PATHwise
+
+from conda_env.env import from_environment
+
+try:
+    from unittest.mock import patch
+except ImportError:
+    from mock import patch
+
+
+PYTHON_BINARY = 'python.exe' if on_win else 'bin/python'
 
 
 try:
@@ -11,10 +33,10 @@ try:
 except ImportError:
     from StringIO import StringIO
 
+import pytest
+
 from conda_env import env
 from conda_env import exceptions
-
-from . import utils
 
 
 class FakeStream(object):
@@ -25,8 +47,20 @@ class FakeStream(object):
         self.output += chunk.decode('utf-8')
 
 
+def get_environment(filename):
+    return env.from_file(support_file(filename))
+
+
 def get_simple_environment():
-    return env.from_file(utils.support_file('simple.yml'))
+    return get_environment('simple.yml')
+
+
+def get_valid_keys_environment():
+    return get_environment('valid_keys.yml')
+
+
+def get_invalid_keys_environment():
+    return get_environment('invalid_keys.yml')
 
 
 class from_file_TestCase(unittest.TestCase):
@@ -36,13 +70,25 @@ class from_file_TestCase(unittest.TestCase):
 
     def test_retains_full_filename(self):
         e = get_simple_environment()
-        self.assertEqual(utils.support_file('simple.yml'), e.filename)
+        self.assertEqual(support_file('simple.yml'), e.filename)
 
     def test_with_pip(self):
-        e = env.from_file(utils.support_file('with-pip.yml'))
+        e = env.from_file(support_file('with-pip.yml'))
         assert 'pip' in e.dependencies
         assert 'foo' in e.dependencies['pip']
         assert 'baz' in e.dependencies['pip']
+
+    @pytest.mark.integration
+    def test_http(self):
+        e = get_simple_environment()
+        f = env.from_file("https://raw.githubusercontent.com/conda/conda/master/tests/conda_env/support/simple.yml")
+        self.assertEqual(e.dependencies, f.dependencies)
+        assert e.dependencies == f.dependencies
+
+    @pytest.mark.integration
+    def test_http_raises(self):
+        with self.assertRaises(CondaHTTPError):
+            env.from_file("https://raw.githubusercontent.com/conda/conda/master/tests/conda_env/support/does-not-exist.yml")
 
 
 class EnvironmentTestCase(unittest.TestCase):
@@ -90,7 +136,7 @@ class EnvironmentTestCase(unittest.TestCase):
             dependencies=['nltk', {'pip': ['foo', 'bar']}]
         )
         expected = OrderedDict([
-            ('conda', ['nltk']),
+            ('conda', ['nltk', 'pip']),
             ('pip', ['foo', 'bar'])
         ])
         self.assertEqual(e.dependencies, expected)
@@ -215,9 +261,21 @@ class EnvironmentTestCase(unittest.TestCase):
         e.dependencies.add('bar')
         assert 'bar' in e.dependencies['conda']
 
+    def test_valid_keys(self):
+        e = get_valid_keys_environment()
+        e_dict = e.to_dict()
+        for key in env.VALID_KEYS:
+            assert key in e_dict
+
+    def test_invalid_keys(self):
+        e = get_invalid_keys_environment()
+        e_dict = e.to_dict()
+        assert 'name' in e_dict
+        assert len(e_dict) == 1
+
 
 class DirectoryTestCase(unittest.TestCase):
-    directory = utils.support_file('example')
+    directory = support_file('example')
 
     def setUp(self):
         self.original_working_dir = os.getcwd()
@@ -238,23 +296,23 @@ class DirectoryTestCase(unittest.TestCase):
 
 
 class load_from_directory_example_TestCase(DirectoryTestCase):
-    directory = utils.support_file('example')
+    directory = support_file('example')
 
 
 class load_from_directory_example_yaml_TestCase(DirectoryTestCase):
-    directory = utils.support_file('example-yaml')
+    directory = support_file('example-yaml')
 
 
 class load_from_directory_recursive_TestCase(DirectoryTestCase):
-    directory = utils.support_file('foo/bar')
+    directory = support_file('foo/bar')
 
 
 class load_from_directory_recursive_two_TestCase(DirectoryTestCase):
-    directory = utils.support_file('foo/bar/baz')
+    directory = support_file('foo/bar/baz')
 
 
 class load_from_directory_trailing_slash_TestCase(DirectoryTestCase):
-    directory = utils.support_file('foo/bar/baz/')
+    directory = support_file('foo/bar/baz/')
 
 
 class load_from_directory_TestCase(unittest.TestCase):
@@ -269,7 +327,7 @@ class load_from_directory_TestCase(unittest.TestCase):
 
 
 class LoadEnvFromFileAndSaveTestCase(unittest.TestCase):
-    env_path = utils.support_file(os.path.join('saved-env', 'environment.yml'))
+    env_path = support_file(os.path.join('saved-env', 'environment.yml'))
 
     def setUp(self):
         with open(self.env_path, "rb") as fp:
@@ -293,7 +351,7 @@ class LoadEnvFromFileAndSaveTestCase(unittest.TestCase):
 
 
 class EnvironmentSaveTestCase(unittest.TestCase):
-    env_file = utils.support_file('saved.yml')
+    env_file = support_file('saved.yml')
 
     def tearDown(self):
         if os.path.exists(self.env_file):
@@ -316,3 +374,52 @@ class EnvironmentSaveTestCase(unittest.TestCase):
 
         self.assert_(len(actual) > 0, msg='sanity check')
         self.assertEqual(e.to_yaml(), actual)
+
+
+class SaveExistingEnvTestCase(unittest.TestCase):
+    @unittest.skipIf(not is_prefix_activated_PATHwise(),
+                      "You are running `pytest` outside of proper activation. "
+                      "The entries necessary for conda to operate correctly "
+                      "are not on PATH.  Please use `conda activate`")
+    @pytest.mark.integration
+    def test_create_advanced_pip(self):
+        with make_temp_envs_dir() as envs_dir:
+            with env_vars({
+                'CONDA_ENVS_DIRS': envs_dir,
+                'CONDA_DLL_SEARCH_MODIFICATION_ENABLE': 'true',
+            }, stack_callback=conda_tests_ctxt_mgmt_def_pol):
+                env_name = str(uuid4())[:8]
+                run_command(Commands.CREATE, env_name,
+                            support_file('pip_argh.yml'))
+                out_file = join(envs_dir, 'test_env.yaml')
+
+            # make sure that the export reconsiders the presence of pip interop being enabled
+            PrefixData._cache_.clear()
+
+            with env_vars({
+                'CONDA_ENVS_DIRS': envs_dir,
+            }, stack_callback=conda_tests_ctxt_mgmt_def_pol):
+                # note: out of scope of pip interop var.  Should be enabling conda pip interop itself.
+                run_command(Commands.EXPORT, env_name, out_file)
+                with open(out_file) as f:
+                    d = yaml_load(f)
+                assert {'pip': ['argh==0.26.2']} in d['dependencies']
+
+
+class TestFromEnvironment(unittest.TestCase):
+    def test_from_history(self):
+        # We're not testing that get_requested_specs_map() actually works
+        # assume it gives us back a dict of MatchSpecs
+        with patch('conda.history.History.get_requested_specs_map') as m:
+            m.return_value = {
+                'python': MatchSpec('python=3'),
+                'pytest': MatchSpec('pytest!=3.7.3'),
+                'mock': MatchSpec('mock'),
+                'yaml': MatchSpec('yaml>=0.1')
+            }
+            out = from_environment('mock_env', 'mock_prefix', from_history=True)
+            assert "yaml[version='>=0.1']" in out.to_dict()['dependencies']
+            assert "pytest!=3.7.3" in out.to_dict()['dependencies']
+            assert len(out.to_dict()['dependencies']) == 4
+
+            m.assert_called()

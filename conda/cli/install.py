@@ -1,31 +1,35 @@
-# (c) Continuum Analytics, Inc. / http://continuum.io
-# All Rights Reserved
-#
-# conda is distributed under the terms of the BSD 3-clause license.
-# Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
-
+# -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 from logging import getLogger
 import os
-from os.path import abspath, basename, exists, isdir
+from os.path import abspath, basename, exists, isdir, isfile, join
 
 from . import common
 from .common import check_non_admin
+from .. import CondaError
 from .._vendor.auxlib.ish import dals
-from ..base.constants import ROOT_ENV_NAME
-from ..base.context import context
-from ..common.compat import on_win, text_type
-from ..core.envs_manager import EnvsDirectory
+from ..base.constants import ROOT_ENV_NAME, UpdateModifier, REPODATA_FN
+from ..base.context import context, locate_prefix_by_name
+from ..common.compat import text_type
+from ..common.constants import NULL
+from ..common.path import paths_equal, is_package_file
 from ..core.index import calculate_channel_urls, get_index
-from ..core.solve import Solver
+from ..core.prefix_data import PrefixData
+from ..core.solve import DepsModifier, Solver
 from ..exceptions import (CondaExitZero, CondaImportError, CondaOSError, CondaSystemExit,
-                          CondaValueError, DirectoryNotFoundError, DryRunExit,
-                          EnvironmentLocationNotFound, PackagesNotFoundError,
-                          TooManyArgumentsError, UnsatisfiableError)
-from ..misc import append_env, clone_env, explicit, touch_nonadmin
+                          CondaValueError, DirectoryNotACondaEnvironmentError,
+                          DirectoryNotFoundError, DryRunExit, EnvironmentLocationNotFound,
+                          NoBaseEnvironmentError, PackageNotInstalledError, PackagesNotFoundError,
+                          TooManyArgumentsError, UnsatisfiableError,
+                          SpecsConfigurationConflictError)
+from ..gateways.disk.create import mkdir_p
+from ..gateways.disk.delete import delete_trash, path_is_clean
+from ..misc import clone_env, explicit, touch_nonadmin
 from ..models.match_spec import MatchSpec
-from ..plan import (revert_actions)
+from ..plan import revert_actions
 from ..resolve import ResolvePackageNotFound
 
 log = getLogger(__name__)
@@ -46,9 +50,9 @@ def check_prefix(prefix, json=False):
         raise CondaValueError(error, json)
 
     if ' ' in prefix:
-        stderrlog.warn("WARNING: A space was detected in your requested environment path\n"
-                       "'%s'\n"
-                       "Spaces in paths can sometimes be problematic." % prefix)
+        stderrlog.warning("WARNING: A space was detected in your requested environment path\n"
+                          "'%s'\n"
+                          "Spaces in paths can sometimes be problematic." % prefix)
 
 
 def clone(src_arg, dst_prefix, json=False, quiet=False, index_args=None):
@@ -58,7 +62,7 @@ def clone(src_arg, dst_prefix, json=False, quiet=False, index_args=None):
             raise DirectoryNotFoundError(src_arg)
     else:
         assert context._argparse_args.clone is not None
-        src_prefix = EnvsDirectory.locate_prefix_by_name(context._argparse_args.clone)
+        src_prefix = locate_prefix_by_name(context._argparse_args.clone)
 
     if not json:
         print("Source:      %s" % src_prefix)
@@ -80,39 +84,16 @@ def clone(src_arg, dst_prefix, json=False, quiet=False, index_args=None):
 
 def print_activate(env_name_or_prefix):  # pragma: no cover
     if not context.quiet and not context.json:
-        if 'CONDA_SHLVL' in os.environ or os.path.split(os.environ.get('SHELL', ''))[-1] == 'fish':
-            message = dals("""
-            #
-            # To activate this environment, use
-            #
-            #     $ conda activate %s
-            #
-            # To deactivate an active environment, use
-            #
-            #     $ conda deactivate
-            """) % env_name_or_prefix
-        elif on_win:
-            message = dals("""
-            #
-            # To activate this environment, use:
-            # > activate %s
-            #
-            # To deactivate an active environment, use:
-            # > deactivate
-            #
-            # * for power-users using bash, you must source
-            #
-            """) % env_name_or_prefix
-        else:
-            message = dals("""
-            #
-            # To activate this environment, use:
-            # > source activate %s
-            #
-            # To deactivate an active environment, use:
-            # > source deactivate
-            #
-            """) % env_name_or_prefix
+        message = dals("""
+        #
+        # To activate this environment, use
+        #
+        #     $ conda activate %s
+        #
+        # To deactivate an active environment, use
+        #
+        #     $ conda deactivate
+        """) % env_name_or_prefix
         print(message)  # TODO: use logger
 
 
@@ -120,7 +101,7 @@ def get_revision(arg, json=False):
     try:
         return int(arg)
     except ValueError:
-        CondaValueError("expected revision number, not: '%s'" % arg, json)
+        raise CondaValueError("expected revision number, not: '%s'" % arg, json)
 
 
 def install(args, parser, command='install'):
@@ -129,23 +110,51 @@ def install(args, parser, command='install'):
     """
     context.validate_configuration()
     check_non_admin()
+    # this is sort of a hack.  current_repodata.json may not have any .tar.bz2 files,
+    #    because it deduplicates records that exist as both formats.  Forcing this to
+    #    repodata.json ensures that .tar.bz2 files are available
+    if context.use_only_tar_bz2:
+        args.repodata_fns = ('repodata.json', )
 
     newenv = bool(command == 'create')
     isupdate = bool(command == 'update')
     isinstall = bool(command == 'install')
+    isremove = bool(command == 'remove')
     if newenv:
         common.ensure_name_or_prefix(args, command)
     prefix = context.target_prefix
     if newenv:
         check_prefix(prefix, json=context.json)
     if context.force_32bit and prefix == context.root_prefix:
-        raise CondaValueError("cannot use CONDA_FORCE_32BIT=1 in root env")
-    if isupdate and not (args.file or args.all or args.packages):
+        raise CondaValueError("cannot use CONDA_FORCE_32BIT=1 in base env")
+    if isupdate and not (args.file or args.packages
+                         or context.update_modifier == UpdateModifier.UPDATE_ALL):
         raise CondaValueError("""no package names supplied
 # If you want to update to a newer version of Anaconda, type:
 #
 # $ conda update --prefix %s anaconda
 """ % prefix)
+
+    if not newenv:
+        if isdir(prefix):
+            delete_trash(prefix)
+            if not isfile(join(prefix, 'conda-meta', 'history')):
+                if paths_equal(prefix, context.conda_prefix):
+                    raise NoBaseEnvironmentError()
+                else:
+                    if not path_is_clean(prefix):
+                        raise DirectoryNotACondaEnvironmentError(prefix)
+            else:
+                # fall-through expected under normal operation
+                pass
+        else:
+            if args.mkdir:
+                try:
+                    mkdir_p(prefix)
+                except EnvironmentError as e:
+                    raise CondaOSError("Could not create directory: %s" % prefix, caused_by=e)
+            else:
+                raise EnvironmentLocationNotFound(prefix)
 
     args_packages = [s.strip('"\'') for s in args.packages]
     if newenv and not args.no_default_packages:
@@ -156,7 +165,6 @@ def install(args, parser, command='install'):
             default_pkg_name = default_pkg.replace(' ', '=').split('=', 1)[0]
             if default_pkg_name not in args_packages_names:
                 args_packages.append(default_pkg)
-    args_packages.extend(text_type(MatchSpec(provides_features=ft)) for ft in args.features or ())
 
     index_args = {
         'use_cache': args.use_index_cache,
@@ -166,7 +174,7 @@ def install(args, parser, command='install'):
         'use_local': args.use_local
     }
 
-    num_cp = sum(s.endswith('.tar.bz2') for s in args_packages)
+    num_cp = sum(is_package_file(s) for s in args_packages)
     if num_cp:
         if num_cp == len(args_packages):
             explicit(args_packages, prefix, verbose=not context.quiet)
@@ -178,7 +186,11 @@ def install(args, parser, command='install'):
     specs = []
     if args.file:
         for fpath in args.file:
-            specs.extend(common.specs_from_url(fpath, json=context.json))
+            try:
+                specs.extend(common.specs_from_url(fpath, json=context.json))
+            except UnicodeError:
+                raise CondaError("Error reading file, file should be a text file containing"
+                                 " packages \nconda create --help for details")
         if '@EXPLICIT' in specs:
             explicit(specs, prefix, verbose=not context.quiet, index_args=index_args)
             return
@@ -190,61 +202,122 @@ def install(args, parser, command='install'):
         raise CondaValueError("too few arguments, "
                               "must supply command line package specs or --file")
 
+    # for 'conda update', make sure the requested specs actually exist in the prefix
+    # and that they are name-only specs
+    if isupdate and context.update_modifier != UpdateModifier.UPDATE_ALL:
+        prefix_data = PrefixData(prefix)
+        for spec in specs:
+            spec = MatchSpec(spec)
+            if not spec.is_name_only_spec:
+                raise CondaError("Invalid spec for 'conda update': %s\n"
+                                 "Use 'conda install' instead." % spec)
+            if not prefix_data.get(spec.name, None):
+                raise PackageNotInstalledError(prefix, spec.name)
+
     if newenv and args.clone:
         if args.packages:
             raise TooManyArgumentsError(0, len(args.packages), list(args.packages),
                                         'did not expect any arguments for --clone')
 
         clone(args.clone, prefix, json=context.json, quiet=context.quiet, index_args=index_args)
-        append_env(prefix)
         touch_nonadmin(prefix)
         print_activate(args.name if args.name else prefix)
         return
 
-    if not isdir(prefix) and not newenv:
-        if args.mkdir:
-            try:
-                os.makedirs(prefix)
-            except OSError:
-                raise CondaOSError("Error: could not create directory: %s" % prefix)
-        else:
-            raise EnvironmentLocationNotFound(prefix)
+    repodata_fns = args.repodata_fns
+    if not repodata_fns:
+        repodata_fns = context.repodata_fns
+    if REPODATA_FN not in repodata_fns:
+        repodata_fns.append(REPODATA_FN)
 
-    try:
-        if isinstall and args.revision:
-            index = get_index(channel_urls=index_args['channel_urls'],
-                              prepend=index_args['prepend'], platform=None,
-                              use_local=index_args['use_local'], use_cache=index_args['use_cache'],
-                              unknown=index_args['unknown'], prefix=prefix)
-            unlink_link_transaction = revert_actions(prefix, get_revision(args.revision), index)
-            progressive_fetch_extract = unlink_link_transaction.get_pfe()
-        else:
-            solver = Solver(prefix, context.channels, context.subdirs, specs_to_add=specs)
-            unlink_link_transaction = solver.solve_for_transaction(
-                force_reinstall=context.force,
-            )
-            progressive_fetch_extract = unlink_link_transaction.get_pfe()
+    args_set_update_modifier = hasattr(args, "update_modifier") and args.update_modifier != NULL
+    # This helps us differentiate between an update, the --freeze-installed option, and the retry
+    # behavior in our initial fast frozen solve
+    _should_retry_unfrozen = (not args_set_update_modifier or args.update_modifier not in (
+        UpdateModifier.FREEZE_INSTALLED,
+        UpdateModifier.UPDATE_SPECS)) and not newenv
 
-    except ResolvePackageNotFound as e:
-        channels_urls = tuple(calculate_channel_urls(
-            channel_urls=index_args['channel_urls'],
-            prepend=index_args['prepend'],
-            platform=None,
-            use_local=index_args['use_local'],
-        ))
-        raise PackagesNotFoundError(e.bad_deps, channels_urls)
+    for repodata_fn in repodata_fns:
+        try:
+            if isinstall and args.revision:
+                index = get_index(channel_urls=index_args['channel_urls'],
+                                  prepend=index_args['prepend'], platform=None,
+                                  use_local=index_args['use_local'],
+                                  use_cache=index_args['use_cache'],
+                                  unknown=index_args['unknown'], prefix=prefix,
+                                  repodata_fn=repodata_fn)
+                unlink_link_transaction = revert_actions(prefix, get_revision(args.revision),
+                                                         index)
+            else:
+                solver = Solver(prefix, context.channels, context.subdirs, specs_to_add=specs,
+                                repodata_fn=repodata_fn, command=args.cmd)
+                update_modifier = context.update_modifier
+                if (isinstall or isremove) and args.update_modifier == NULL:
+                    update_modifier = UpdateModifier.FREEZE_INSTALLED
+                deps_modifier = context.deps_modifier
+                if isupdate:
+                    deps_modifier = context.deps_modifier or DepsModifier.UPDATE_SPECS
 
-    except (UnsatisfiableError, SystemExit) as e:
-        # Unsatisfiable package specifications/no such revision/import error
-        if e.args and 'could not import' in e.args[0]:
-            raise CondaImportError(text_type(e))
-        raise
+                unlink_link_transaction = solver.solve_for_transaction(
+                    deps_modifier=deps_modifier,
+                    update_modifier=update_modifier,
+                    force_reinstall=context.force_reinstall or context.force,
+                    should_retry_solve=(_should_retry_unfrozen or repodata_fn != repodata_fns[-1]),
+                )
+            # we only need one of these to work.  If we haven't raised an exception,
+            #   we're good.
+            break
 
-    handle_txn(progressive_fetch_extract, unlink_link_transaction, prefix, args, newenv)
+        except (ResolvePackageNotFound, PackagesNotFoundError) as e:
+            # end of the line.  Raise the exception
+            if repodata_fn == repodata_fns[-1]:
+                # PackagesNotFoundError is the only exception type we want to raise.
+                #    Over time, we should try to get rid of ResolvePackageNotFound
+                if isinstance(e, PackagesNotFoundError):
+                    raise e
+                else:
+                    channels_urls = tuple(calculate_channel_urls(
+                        channel_urls=index_args['channel_urls'],
+                        prepend=index_args['prepend'],
+                        platform=None,
+                        use_local=index_args['use_local'],
+                    ))
+                    # convert the ResolvePackageNotFound into PackagesNotFoundError
+                    raise PackagesNotFoundError(e._formatted_chains, channels_urls)
+
+        except (UnsatisfiableError, SystemExit, SpecsConfigurationConflictError) as e:
+            # Quick solve with frozen env or trimmed repodata failed.  Try again without that.
+            if not hasattr(args, 'update_modifier'):
+                if repodata_fn == repodata_fns[-1]:
+                    raise e
+            elif _should_retry_unfrozen:
+                try:
+                    unlink_link_transaction = solver.solve_for_transaction(
+                        deps_modifier=deps_modifier,
+                        update_modifier=UpdateModifier.UPDATE_SPECS,
+                        force_reinstall=context.force_reinstall or context.force,
+                        should_retry_solve=(repodata_fn != repodata_fns[-1]),
+                    )
+                except (UnsatisfiableError, SystemExit, SpecsConfigurationConflictError) as e:
+                    # Unsatisfiable package specifications/no such revision/import error
+                    if e.args and 'could not import' in e.args[0]:
+                        raise CondaImportError(text_type(e))
+                    # we want to fall through without raising if we're not at the end of the list
+                    #    of fns.  That way, we fall to the next fn.
+                    if repodata_fn == repodata_fns[-1]:
+                        raise e
+            elif repodata_fn != repodata_fns[-1]:
+                continue  # if we hit this, we should retry with next repodata source
+            else:
+                # end of the line.  Raise the exception
+                # Unsatisfiable package specifications/no such revision/import error
+                if e.args and 'could not import' in e.args[0]:
+                    raise CondaImportError(text_type(e))
+                raise e
+    handle_txn(unlink_link_transaction, prefix, args, newenv)
 
 
-def handle_txn(progressive_fetch_extract, unlink_link_transaction, prefix, args, newenv,
-               remove_op=False):
+def handle_txn(unlink_link_transaction, prefix, args, newenv, remove_op=False):
     if unlink_link_transaction.nothing_to_do:
         if remove_op:
             # No packages found to remove from environment
@@ -257,16 +330,16 @@ def handle_txn(progressive_fetch_extract, unlink_link_transaction, prefix, args,
             return
 
     if not context.json:
-        unlink_link_transaction.display_actions(progressive_fetch_extract)
+        unlink_link_transaction.print_transaction_summary()
         common.confirm_yn()
 
     elif context.dry_run:
-        actions = unlink_link_transaction.make_legacy_action_groups(progressive_fetch_extract)[0]
+        actions = unlink_link_transaction._make_legacy_action_groups()[0]
         common.stdout_json_success(prefix=prefix, actions=actions, dry_run=True)
         raise DryRunExit()
 
     try:
-        progressive_fetch_extract.execute()
+        unlink_link_transaction.download_and_extract()
         if context.download_only:
             raise CondaExitZero('Package caches prepared. UnlinkLinkTransaction cancelled with '
                                 '--download-only option.')
@@ -276,10 +349,9 @@ def handle_txn(progressive_fetch_extract, unlink_link_transaction, prefix, args,
         raise CondaSystemExit('Exiting', e)
 
     if newenv:
-        append_env(prefix)
         touch_nonadmin(prefix)
         print_activate(args.name if args.name else prefix)
 
     if context.json:
-        actions = unlink_link_transaction.make_legacy_action_groups(progressive_fetch_extract)[0]
+        actions = unlink_link_transaction._make_legacy_action_groups()[0]
         common.stdout_json_success(prefix=prefix, actions=actions)

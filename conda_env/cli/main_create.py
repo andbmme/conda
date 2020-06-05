@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from __future__ import print_function
 
 from argparse import RawDescriptionHelpFormatter
@@ -7,10 +10,11 @@ import textwrap
 
 from conda._vendor.auxlib.path import expand
 from conda.cli import install as cli_install
-from conda.cli.conda_argparse import add_parser_json, add_parser_prefix
+from conda.cli.conda_argparse import add_parser_json, add_parser_prefix, add_parser_networking
+from conda.gateways.connection.session import CONDA_SESSION_SCHEMES
 from conda.gateways.disk.delete import rm_rf
 from conda.misc import touch_nonadmin
-from .common import get_prefix
+from .common import get_prefix, print_result
 from .. import exceptions, specs
 from ..installers.base import InvalidInstaller, get_installer
 
@@ -47,11 +51,9 @@ def configure_parser(sub_parsers):
     # Add name and prefix args
     add_parser_prefix(p)
 
-    p.add_argument(
-        '-q', '--quiet',
-        action='store_true',
-        default=False,
-    )
+    # Add networking args
+    add_parser_networking(p)
+
     p.add_argument(
         'remote_definition',
         help='remote environment definition / IPython notebook',
@@ -67,7 +69,7 @@ def configure_parser(sub_parsers):
         default=False,
     )
     add_parser_json(p)
-    p.set_defaults(func=execute)
+    p.set_defaults(func='.main_create.execute')
 
 
 def execute(args, parser):
@@ -75,8 +77,13 @@ def execute(args, parser):
     name = args.remote_definition or args.name
 
     try:
-        spec = specs.detect(name=name, filename=expand(args.file),
-                            directory=os.getcwd())
+        url_scheme = args.file.split("://", 1)[0]
+        if url_scheme in CONDA_SESSION_SCHEMES:
+            filename = args.file
+        else:
+            filename = expand(args.file)
+
+        spec = specs.detect(name=name, filename=filename, directory=os.getcwd())
         env = spec.environment
 
         # FIXME conda code currently requires args to have a name or prefix
@@ -97,26 +104,28 @@ def execute(args, parser):
     # common.ensure_override_channels_requires_channel(args)
     # channel_urls = args.channel or ()
 
-    # # special case for empty environment
-    # if not env.dependencies:
-    #     from conda.install import symlink_conda
-    #     symlink_conda(prefix, context.root_dir)
+    result = {"conda": None, "pip": None}
+    if len(env.dependencies.items()) == 0:
+        installer_type = "conda"
+        pkg_specs = []
+        installer = get_installer(installer_type)
+        result[installer_type] = installer.install(prefix, pkg_specs, args, env)
+    else:
+        for installer_type, pkg_specs in env.dependencies.items():
+            try:
+                installer = get_installer(installer_type)
+                result[installer_type] = installer.install(prefix, pkg_specs, args, env)
+            except InvalidInstaller:
+                sys.stderr.write(textwrap.dedent("""
+                    Unable to install package for {0}.
 
-    for installer_type, pkg_specs in env.dependencies.items():
-        try:
-            installer = get_installer(installer_type)
-            installer.install(prefix, pkg_specs, args, env)
-        except InvalidInstaller:
-            sys.stderr.write(textwrap.dedent("""
-                Unable to install package for {0}.
-
-                Please double check and ensure you dependencies file has
-                the correct spelling.  You might also try installing the
-                conda-env-{0} package to see if provides the required
-                installer.
-                """).lstrip().format(installer_type)
-            )
-            return -1
+                    Please double check and ensure your dependencies file has
+                    the correct spelling.  You might also try installing the
+                    conda-env-{0} package to see if provides the required
+                    installer.
+                    """).lstrip().format(installer_type)
+                )
+                return -1
 
     touch_nonadmin(prefix)
-    cli_install.print_activate(args.name if args.name else prefix)
+    print_result(args, prefix, result)

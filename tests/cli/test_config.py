@@ -4,11 +4,11 @@
 # conda is distributed under the terms of the BSD 3-clause license.
 # Consult LICENSE.txt or http://opensource.org/licenses/BSD-3-Clause.
 from contextlib import contextmanager
-from tempfile import NamedTemporaryFile
+from conda._vendor.auxlib.compat import Utf8NamedTemporaryFile
 
 from conda.base.context import context, reset_context
 from conda.cli.python_api import Commands, run_command
-from conda.common.configuration import LoadError
+from conda.common.configuration import ConfigurationLoadError
 from conda.common.serialize import yaml_load
 from conda.gateways.disk.delete import rm_rf
 
@@ -22,12 +22,12 @@ from conda.gateways.disk.delete import rm_rf
 #     pass
 
 # unset CIO_TEST.  This is a Continuum-internal variable that draws packages from an internal server instead of
-#     repo.continuum.io
+#     repo.anaconda.com
 
 @contextmanager
 def make_temp_condarc(value=None):
     try:
-        tempfile = NamedTemporaryFile(suffix='.yml', delete=False)
+        tempfile = Utf8NamedTemporaryFile(suffix='.yml', delete=False)
         tempfile.close()
         temp_path = tempfile.name
         if value:
@@ -54,11 +54,8 @@ channels:
         with make_temp_condarc(condarc) as rc:
             rc_path = rc
             run_command(Commands.CONFIG, '--file', rc, '--add', 'channels', 'test')
-    except LoadError as err:
-        error1 = "Load Error: in "
-        error2 = "on line 1, column 8. Invalid YAML"
-        assert error1 in err.message
-        assert error2 in err.message
+    except ConfigurationLoadError as err:
+        assert "reason: invalid yaml at line" in err.message, err.message
 
 # Tests for the conda config command
 # FIXME This shoiuld be multiple individual tests
@@ -333,10 +330,10 @@ always_yes: true
 
     with make_temp_condarc(condarc) as rc:
         stdout, stderr, return_code = run_command(Commands.CONFIG, '--file', rc, '--add',
-                                           'disallow', 'perl')
+                                           'disallowed_packages', 'perl')
         assert stdout == stderr == ''
         assert _read_test_condarc(rc) == condarc + """\
-disallow:
+disallowed_packages:
   - perl
 """
 
@@ -451,7 +448,7 @@ def test_set_rc_string():
         reset_context([rc])
         assert context.ssl_verify is False
 
-        with NamedTemporaryFile() as tf:
+        with Utf8NamedTemporaryFile() as tf:
             stdout, stderr, return_code = run_command(Commands.CONFIG, '--file', rc,
                                                       '--set', 'ssl_verify', tf.name)
             assert stdout == ''

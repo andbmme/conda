@@ -1,13 +1,15 @@
+# -*- coding: utf-8 -*-
+# Copyright (C) 2012 Anaconda, Inc
+# SPDX-License-Identifier: BSD-3-Clause
 from argparse import RawDescriptionHelpFormatter
 import os
 import sys
 import textwrap
 
 from conda._vendor.auxlib.path import expand
-from conda.cli import install as cli_install
 from conda.cli.conda_argparse import add_parser_json, add_parser_prefix
 from conda.misc import touch_nonadmin
-from .common import get_prefix
+from .common import get_prefix, print_result
 from .. import exceptions, specs as install_specs
 from ..exceptions import CondaEnvException
 from ..installers.base import InvalidInstaller, get_installer
@@ -48,11 +50,6 @@ def configure_parser(sub_parsers):
         help='remove installed packages not defined in environment.yml',
     )
     p.add_argument(
-        '-q', '--quiet',
-        action='store_true',
-        default=False,
-    )
-    p.add_argument(
         'remote_definition',
         help='remote environment definition / IPython notebook',
         action='store',
@@ -60,7 +57,7 @@ def configure_parser(sub_parsers):
         nargs='?'
     )
     add_parser_json(p)
-    p.set_defaults(func=execute)
+    p.set_defaults(func='.main_update.execute')
 
 
 def execute(args, parser):
@@ -75,7 +72,7 @@ def execute(args, parser):
 
     if not (args.name or args.prefix):
         if not env.name:
-                    # Note, this is a hack fofr get_prefix that assumes argparse results
+            # Note, this is a hack fofr get_prefix that assumes argparse results
             # TODO Refactor common.get_prefix
             name = os.environ.get('CONDA_DEFAULT_ENV', False)
             if not name:
@@ -101,10 +98,14 @@ def execute(args, parser):
     # common.ensure_override_channels_requires_channel(args)
     # channel_urls = args.channel or ()
 
-    for installer_type, specs in env.dependencies.items():
+    # create installers before running any of them
+    # to avoid failure to import after the file being deleted
+    # e.g. due to conda_env being upgraded or Python version switched.
+    installers = {}
+
+    for installer_type in env.dependencies:
         try:
-            installer = get_installer(installer_type)
-            installer.install(prefix, specs, args, env)
+            installers[installer_type] = get_installer(installer_type)
         except InvalidInstaller:
             sys.stderr.write(textwrap.dedent("""
                 Unable to install package for {0}.
@@ -117,5 +118,10 @@ def execute(args, parser):
             )
             return -1
 
+    result = {"conda": None, "pip": None}
+    for installer_type, specs in env.dependencies.items():
+        installer = installers[installer_type]
+        result[installer_type] = installer.install(prefix, specs, args, env)
+
     touch_nonadmin(prefix)
-    cli_install.print_activate(args.name if args.name else prefix)
+    print_result(args, prefix, result)
